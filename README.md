@@ -1,22 +1,25 @@
-# CS2 Case Monitor — Servidor 24/7
+# CS2 Case Monitor — Servidor 24/7 (Playwright)
 
-Monitor automático para skin.club que envía alertas por Telegram.
+Monitor automático para skin.club con alertas por Telegram.
 
-## Despliegue en Railway (gratis)
+## ⚠️ IMPORTANTE — Por qué Playwright y no requests
 
-### 1. Crear cuenta en Railway
-- Ve a https://railway.app y regístrate con GitHub
+skin.club genera los drops y el contador mediante JavaScript en el navegador.
+El HTML que devuelve el servidor está VACÍO de datos. Por eso un scraper normal
+con requests/BeautifulSoup no funciona: hace falta un navegador real headless
+(Chromium vía Playwright) que ejecute ese JavaScript.
 
-### 2. Subir el código a GitHub
-- Crea un repo nuevo en https://github.com/new (puede ser privado)
-- Sube estos archivos: monitor.py, requirements.txt, Procfile, railway.toml
+## Despliegue en Railway
 
-### 3. Crear proyecto en Railway
-- En Railway: New Project → Deploy from GitHub repo
-- Selecciona tu repo
+### 1. Sube estos archivos a un repo de GitHub
+- Dockerfile
+- monitor.py
+- requirements.txt
+- railway.toml
 
-### 4. Configurar variables de entorno
-En Railway → tu proyecto → Variables, añade:
+### 2. En Railway: New Project → Deploy from GitHub repo
+
+### 3. Variables de entorno (Settings → Variables)
 
 | Variable | Valor |
 |----------|-------|
@@ -28,20 +31,22 @@ En Railway → tu proyecto → Variables, añade:
 | THRESHOLD_COMB | 90 |
 | ALERT_COOLDOWN | 300 |
 
-### 5. Deploy
-Railway despliega automáticamente. Ve a Logs para ver que funciona.
-Deberías recibir un mensaje de Telegram "🟢 CS2 Monitor iniciado".
+### 4. Deploy
+Railway detecta el Dockerfile (imagen oficial de Playwright con Chromium ya
+instalado) y despliega. El primer build tarda ~3-4 min porque la imagen es grande.
 
-## Mensajes que recibirás
+Al arrancar recibirás en Telegram:
+1. "⏳ CS2 Monitor desplegado" — confirma que el deploy funciona
+2. "🟢 CS2 Monitor iniciado" — confirma que el scrapeo funciona (con counter base)
 
-- 🟢 Al arrancar: confirmación con counter base
-- ✅ Cuando cae un drop raro: nombre, wear, precio, counter
-- 🔥 Alerta individual: cuando un item supera el umbral (ej: Butterfly al 90%)
-- ⚠️ Alerta sequía global: cuando llevan X cajas sin ningún drop raro
+Si recibes el (1) pero NO el (2), significa que skin.club está bloqueando la IP
+del datacenter de Railway. En ese caso la alternativa es la Raspberry Pi en casa
+(IP residencial) con el mismo código.
 
-## Variables opcionales
+## Mensajes
 
-- CHECK_INTERVAL: segundos entre checks (default 60, mínimo recomendado 30)
-- THRESHOLD_IND: % para alerta individual (default 90)
-- THRESHOLD_COMB: % para alerta sequía global (default 90)
-- ALERT_COOLDOWN: segundos entre alertas repetidas del mismo tipo (default 300)
+- ⏳ Deploy correcto
+- 🟢 Scrapeo funcionando (counter base)
+- ✅ Drop raro detectado (resetea su contador)
+- 🔥 Alerta individual (item supera umbral)
+- ⚠️ Alerta sequía global (X cajas sin ningún raro)
