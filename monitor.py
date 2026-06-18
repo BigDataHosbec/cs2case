@@ -179,8 +179,8 @@ def process(data):
     boxes_since_any = max(0, counter - (state['last_any_rare'] or state['base_counter']))
     combined_pct    = prob_acum_combined(boxes_since_any)
 
-    log.info(f"Counter: {counter} | Combined: {combined_pct:.1f}% ({boxes_since_any} cajas) | "
-             f"Items: {[(i['key'], f\"{i['pct']:.1f}%\") for i in hot_items]}")
+    items_summary = ', '.join(i['key'] + ':' + str(round(i['pct'],1)) + '%' for i in hot_items)
+    log.info(f"Counter: {counter} | Combined: {combined_pct:.1f}% ({boxes_since_any} cajas) | Items: {items_summary}")
 
     # ── Alertas individuales ──────────────────────────────────────────────────
     for item in hot_items:
