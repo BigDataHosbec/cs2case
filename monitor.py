@@ -105,18 +105,76 @@ state = {
     'last_alert_comb':  0,
     'initialized':      False,
     'group_probs':      {},
+    'drop_history':     [],   # histórico acumulado de drops raros
 }
 
 dashboard = {
     'counter': None, 'updated': None, 'combined_pct': 0, 'boxes_since_any': 0,
     'hot_items': [], 'last_drops': [], 'expected_every': 0,
     'check_interval': CHECK_INTERVAL, 'status': 'arrancando',
+    'history_24h': [], 'history_stats': {},
 }
 
 def combined_prob(probs_sum, n):
     # P(al menos 1) = 1 - prod (1-pi)^n  ≈  1 - (1 - sum_pi)^n para p pequeñas
     if n <= 0: return 0.0
     return (1 - (1 - probs_sum) ** n) * 100
+
+def parse_dt(s):
+    try:
+        return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+
+def compute_history(now_dt):
+    """Estadísticas del histórico de drops raros."""
+    hist = state['drop_history']
+    parsed = []
+    for d in hist:
+        dt = parse_dt(d.get('created_at', ''))
+        if dt:
+            parsed.append((dt, d))
+    parsed.sort(key=lambda x: x[0])
+
+    def within(hours):
+        cutoff = now_dt.timestamp() - hours * 3600
+        return [d for (dt, d) in parsed if dt.timestamp() >= cutoff]
+
+    last24 = within(24)
+    last48 = within(48)
+
+    by_item_24 = {}
+    for d in last24:
+        by_item_24[d['key']] = by_item_24.get(d['key'], 0) + 1
+
+    intervals = []
+    for i in range(1, len(parsed)):
+        intervals.append((parsed[i][0] - parsed[i-1][0]).total_seconds() / 3600)
+    avg_gap_h = round(sum(intervals) / len(intervals), 1) if intervals else None
+
+    hours_since_last = None
+    if parsed:
+        hours_since_last = round((now_dt.timestamp() - parsed[-1][0].timestamp()) / 3600, 1)
+
+    span_h = None
+    if len(parsed) >= 2:
+        span_h = round((parsed[-1][0].timestamp() - parsed[0][0].timestamp()) / 3600, 1)
+
+    timeline = [{
+        'name': d['name'], 'price': f"${d['price']:.2f}",
+        'created_at': d['created_at'], 'key': d['key']
+    } for (dt, d) in reversed(parsed)]
+
+    stats = {
+        'count_24h': len(last24),
+        'count_48h': len(last48),
+        'by_item_24h': by_item_24,
+        'avg_gap_h': avg_gap_h,
+        'hours_since_last': hours_since_last,
+        'span_h': span_h,
+        'total_tracked': len(parsed),
+    }
+    return stats, timeline
 
 def initialize(data):
     counter = data['counter']
@@ -127,6 +185,11 @@ def initialize(data):
         state['group_last_seen'][g['key']] = counter
     state['seen_drop_ids']  = set(d['drop_id'] for d in data['drops'])
     state['initialized']    = True
+
+    # Sembrar el histórico con los drops raros que ya vienen en el feed (~49h reales)
+    seed = [d for d in data['drops'] if d['key'] is not None]
+    seed.sort(key=lambda x: x.get('created_at', ''))
+    state['drop_history'] = seed
 
     total_p = sum(data['group_probs'].values())
     expected = round(1 / total_p) if total_p > 0 else 0
@@ -168,8 +231,14 @@ def process(data):
         log.info(f"Nuevos raros: {[d['name'] for d in new_rares]}")
     for d in new_rares:
         state['group_last_seen'][d['key']] = counter
+        state['drop_history'].append(d)
     if new_rares:
         state['last_any_rare'] = counter
+
+    # Mantener histórico ordenado y acotado (últimos 7 días / 200 entradas)
+    state['drop_history'].sort(key=lambda x: x.get('created_at', ''))
+    if len(state['drop_history']) > 200:
+        state['drop_history'] = state['drop_history'][-200:]
 
     # Presión individual
     hot_items = []
@@ -185,6 +254,9 @@ def process(data):
     combined_pct = combined_prob(total_p, boxes_since_any)
     expected = round(1 / total_p) if total_p > 0 else 0
 
+    # Histórico
+    hist_stats, timeline = compute_history(datetime.utcnow())
+
     # Dashboard
     dashboard.update({
         'counter': counter,
@@ -196,6 +268,8 @@ def process(data):
                        'pct': round(i['pct'], 2), 'prob': round(i['prob']*100, 4)} for i in hot_items],
         'last_drops': [{'name': d['name'], 'price': f"${d['price']:.2f}",
                         'created_at': d['created_at'], 'key': d['key']} for d in drops[:15]],
+        'history_24h': timeline,
+        'history_stats': hist_stats,
         'status': 'activo',
     })
 
@@ -296,8 +370,15 @@ h1{font-family:'Share Tech Mono',monospace;font-size:14px;color:#4af3ff;letter-s
   <div class="stat"><div class="stat-v" id="sInterval">—</div><div class="stat-l">Check cada</div></div>
   <div class="stat"><div class="stat-v" id="sStatus">—</div><div class="stat-l">Estado</div></div>
 </div>
+<div class="section-t">Histórico de drops raros</div>
+<div class="stats">
+  <div class="stat"><div class="stat-v" id="h24">—</div><div class="stat-l">Raros 24h</div></div>
+  <div class="stat"><div class="stat-v" id="hGap">—</div><div class="stat-l">Cada (h media)</div></div>
+  <div class="stat"><div class="stat-v" id="hLast">—</div><div class="stat-l">Hace (h últim.)</div></div>
+</div>
+<div id="hByItem" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
+<div id="timeline"></div>
 <div class="section-t">Presión individual por item</div><div id="items"></div>
-<div class="section-t">Últimos drops</div><div id="drops"></div>
 <script>
 const RAR={butterfly:'covert',spec_gloves:'covert',awp:'covert',sport_gloves:'covert',ak47:'classified'};
 function zone(p){return p>=90?'hot':p>=70?'warm':''}
@@ -321,7 +402,18 @@ async function load(){
     document.getElementById('items').innerHTML=(d.hot_items||[]).map(i=>{
       const c=zone(i.pct);return `<div class="item"><div class="item-h"><span class="item-n"><span class="dot ${RAR[i.key]||'milspec'}"></span>${i.name} <span style="color:#4a6070;font-size:10px">${i.prob}%</span></span><span class="item-p ${c}">${i.pct.toFixed(1)}%</span></div><div class="itrack"><div class="ifill ${c}" style="width:${Math.min(i.pct,100)}%"></div></div><div class="isub">${(i.n||0).toLocaleString('es-ES')} cajas desde último drop</div></div>`;
     }).join('');
-    document.getElementById('drops').innerHTML=(d.last_drops||[]).map(x=>`<div class="drop"><span class="dot ${RAR[x.key]||'milspec'}"></span><div class="drop-i"><div class="drop-n">${fmtDrop(x.name)}</div><div class="drop-w">${x.created_at||''}</div></div><div class="drop-pr">${x.price}</div></div>`).join('');
+    // Histórico
+    const hs=d.history_stats||{};
+    document.getElementById('h24').textContent=hs.count_24h!=null?hs.count_24h:'—';
+    document.getElementById('hGap').textContent=hs.avg_gap_h!=null?hs.avg_gap_h+'h':'—';
+    document.getElementById('hLast').textContent=hs.hours_since_last!=null?hs.hours_since_last+'h':'—';
+    const NAMES={butterfly:'Butterfly',spec_gloves:'Spec Gloves',awp:'AWP',sport_gloves:'Sport Gloves',ak47:'AK Vulcan'};
+    const byItem=hs.by_item_24h||{};
+    document.getElementById('hByItem').innerHTML=Object.keys(NAMES).map(k=>{
+      const n=byItem[k]||0;const col=n>0?'#4af3ff':'#4a6070';
+      return `<span style="font-family:'Share Tech Mono',monospace;font-size:10px;padding:3px 8px;border:1px solid #1e2a3a;border-radius:3px;color:${col}"><span class="dot ${RAR[k]}"></span> ${NAMES[k]}: ${n}</span>`;
+    }).join('');
+    document.getElementById('timeline').innerHTML=(d.history_24h||[]).slice(0,30).map(x=>`<div class="drop"><span class="dot ${RAR[x.key]||'milspec'}"></span><div class="drop-i"><div class="drop-n">${fmtDrop(x.name)}</div><div class="drop-w">${x.created_at||''}</div></div><div class="drop-pr">${x.price}</div></div>`).join('')||'<div style="font-size:11px;color:#4a6070;font-family:monospace">acumulando histórico...</div>';
   }catch(e){document.getElementById('sub').textContent='error cargando'}
 }
 load();setInterval(load,5000);
