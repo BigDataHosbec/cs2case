@@ -22,40 +22,40 @@ def to_madrid(utc_str):
     except Exception:
         return utc_str
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# ── CONFIG GLOBAL ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = str(os.environ['TELEGRAM_CHAT_ID'])
-CASE_ID          = os.environ.get('CASE_ID', 'cc-bf4940a7e')
-CASE_NAME        = os.environ.get('CASE_NAME', 'DONT TRUST')
-CASE_WEB_URL     = os.environ.get('CASE_WEB_URL', f'https://skin.club/es/cases/open/{CASE_ID}')
-API_URL          = f"https://gate.skin.club/apiv2/cases/{CASE_ID}"
 CHECK_INTERVAL   = int(os.environ.get('CHECK_INTERVAL', '60'))
-# Niveles de alerta: avisa UNA vez al cruzar cada nivel (90% y 95%).
-# No vuelve a avisar de un nivel hasta que la presión baje de 90 (cae un drop) y vuelva a cruzarlo.
 ALERT_LEVELS     = [float(x) for x in os.environ.get('ALERT_LEVELS', '90,95').split(',')]
-DEAD_AFTER_MIN   = int(os.environ.get('DEAD_AFTER_MIN', '60'))   # caja muerta si counter no sube en X min
+DEAD_AFTER_MIN   = int(os.environ.get('DEAD_AFTER_MIN', '60'))
 PORT             = int(os.environ.get('PORT', '8080'))
-STATE_FILE       = os.environ.get('STATE_FILE', '/data/state.json')
+DATA_DIR         = os.environ.get('DATA_DIR', '/data')
+# Umbral de rareza: items con chance <= este % se consideran "raros" y se siguen.
+RARE_MAX_CHANCE  = float(os.environ.get('RARE_MAX_CHANCE', '0.01'))
 
-# ── ITEMS RAROS ───────────────────────────────────────────────────────────────
-RARE_GROUPS = [
-    {'key': 'butterfly',    'name': '★ Butterfly Knife Case Hardened', 'short': 'Butterfly', 'match': ['butterfly knife']},
-    {'key': 'spec_gloves',  'name': '★ Specialist Gloves Blackbook',   'short': 'Spec Gloves', 'match': ['specialist gloves']},
-    {'key': 'awp',          'name': 'AWP Queen\'s Gambit',             'short': 'AWP QG', 'match': ["queen's gambit"]},
-    {'key': 'sport_gloves', 'name': '★ Sport Gloves Frosty',           'short': 'Sport Gloves', 'match': ['sport gloves']},
-    {'key': 'ak47',         'name': 'AK-47 Vulcan',                    'short': 'AK Vulcan', 'match': ['vulcan']},
+# ── DEFINICIÓN DE CAJAS ───────────────────────────────────────────────────────
+# Cada caja: id, nombre visible, y archivo de estado.
+# La primera mantiene el state.json original para no perder el estado sembrado.
+CASES = [
+    {'id': 'cc-bf4940a7e', 'name': 'DONT TRUST',          'state_file': os.path.join(DATA_DIR, 'state.json')},
+    {'id': 'cc-08e7b18f7', 'name': '1º NO PAIN 85%',       'state_file': os.path.join(DATA_DIR, 'state_cc-08e7b18f7.json')},
+    {'id': 'cc-c81e43fb8', 'name': 'NO PAIN 84% PROFIT',   'state_file': os.path.join(DATA_DIR, 'state_cc-c81e43fb8.json')},
 ]
+# Permite override por env (JSON) para añadir/quitar cajas sin tocar código.
+_cases_env = os.environ.get('CASES_JSON')
+if _cases_env:
+    try:
+        CASES = json.loads(_cases_env)
+        for c in CASES:
+            c.setdefault('state_file', os.path.join(DATA_DIR, f"state_{c['id']}.json"))
+    except Exception as e:
+        log.error(f"CASES_JSON inválido, usando cajas por defecto: {e}")
 
-def match_group(name):
-    low = name.lower()
-    for g in RARE_GROUPS:
-        if any(m in low for m in g['match']):
-            return g['key']
-    return None
+def case_web_url(case_id):
+    return f'https://skin.club/es/cases/open/{case_id}'
 
-def group_name(key):
-    g = next((x for x in RARE_GROUPS if x['key'] == key), None)
-    return g['name'] if g else key
+def api_url(case_id):
+    return f'https://gate.skin.club/apiv2/cases/{case_id}'
 
 # ── MATH ──────────────────────────────────────────────────────────────────────
 def prob_acum(p, n):
@@ -80,7 +80,6 @@ def send_telegram(text, reply_markup=None):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ── FETCH API ─────────────────────────────────────────────────────────────────
 HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -89,413 +88,551 @@ HEADERS = {
     'Accept-Language': 'es-ES,es;q=0.9',
 }
 
-def fetch_data():
-    try:
-        r = requests.get(API_URL, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        d = r.json()['data']
+# ── MONITOR DE UNA CAJA ───────────────────────────────────────────────────────
+class CaseMonitor:
+    def __init__(self, case_id, name, state_file):
+        self.case_id = case_id
+        self.name = name
+        self.state_file = state_file
+        self.api = api_url(case_id)
+        self.web = case_web_url(case_id)
+        self.lock = threading.Lock()
+        self.state = {
+            'base_counter': None, 'group_last_seen': {}, 'last_any_rare': None,
+            'seen_drop_ids': set(), 'alerted_levels_ind': {}, 'alerted_levels_comb': [],
+            'initialized': False, 'group_probs': {}, 'rare_meta': {}, 'drop_history': [],
+            'pressure_snapshots': [], 'last_counter': None,
+            'last_counter_change_ts': None, 'dead_alerted': False, 'api_warned': False,
+        }
+        self.dashboard = {
+            'id': case_id, 'name': name, 'counter': None, 'updated': None,
+            'combined_pct': 0, 'boxes_since_any': 0, 'hot_items': [], 'expected_every': 0,
+            'check_interval': CHECK_INTERVAL, 'status': 'arrancando', 'history_24h': [],
+            'history_stats': {}, 'pressure_series': [], 'kpis': {}, 'case_url': self.web,
+            'dead': False,
+        }
+        self.control = {'force_check': False}
 
-        counter    = d['stats']['opening_count']
-        case_price = d.get('price', 0) / 100.0
+    # ── identificación de raros (automática por probabilidad) ──
+    def rare_key(self, name):
+        """Agrupa por nombre base del item (sin desgaste) si es raro."""
+        meta = self.state.get('rare_meta', {})
+        base = self._base_name(name)
+        return base if base in meta else None
 
-        group_probs = {g['key']: 0.0 for g in RARE_GROUPS}
-        contents = (d.get('last_successful_generation') or {}).get('contents', [])
-        ev = 0.0
-        for c in contents:
-            name = c['item']['market_hash_name']
-            p = float(c['chance_percent']) / 100.0
-            price = c['item'].get('price', 0) / 100.0
-            ev += p * price
-            key = match_group(name)
-            if key:
-                group_probs[key] += p
+    @staticmethod
+    def _base_name(market_hash_name):
+        # Quita el desgaste entre paréntesis y el prefijo StatTrak/★ para agrupar variantes
+        n = market_hash_name
+        if '(' in n:
+            n = n[:n.rfind('(')].strip()
+        n = n.replace('StatTrak™', '').replace('★', '').strip()
+        return n
 
-        drops = []
-        for t in d.get('top_drops', []):
-            item = (t.get('reason') or {}).get('item') or t.get('item') or {}
-            name = item.get('market_hash_name', '')
-            if not name:
-                continue
-            drops.append({
-                'name': name, 'price': t['price'] / 100.0,
-                'created_at': t.get('created_at', ''), 'drop_id': t.get('id'),
-                'key': match_group(name),
-            })
+    @staticmethod
+    def _short_name(base):
+        # Versión corta para chips/resúmenes
+        parts = base.split('|')
+        if len(parts) == 2:
+            return parts[1].strip()[:16]
+        return base[:16]
 
-        return {'counter': counter, 'group_probs': group_probs, 'drops': drops,
-                'case_price': case_price, 'ev': ev}
-    except Exception as e:
-        log.error(f"Fetch error: {e}")
-        return None
+    def group_name(self, key):
+        meta = self.state.get('rare_meta', {})
+        return meta.get(key, {}).get('name', key)
 
-# ── ESTADO ────────────────────────────────────────────────────────────────────
-state = {
-    'base_counter':     None,
-    'group_last_seen':  {},
-    'last_any_rare':    None,
-    'seen_drop_ids':    set(),
-    'alerted_levels_ind':  {},   # key -> lista de niveles ya avisados (ej: [90, 95])
-    'alerted_levels_comb': [],   # niveles ya avisados de la sequía global
-    'initialized':      False,
-    'group_probs':      {},
-    'drop_history':     [],
-    'pressure_snapshots': [],     # [{t, counter, combined_pct}] para la gráfica
-    'last_counter':     None,
-    'last_counter_change_ts': None,  # epoch de la última vez que el counter subió
-    'dead_alerted':     False,
-}
-
-# Flags de control desde panel/telegram
-control = {'force_check': False}
-
-# ── PERSISTENCIA ──────────────────────────────────────────────────────────────
-def save_state():
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        s = dict(state)
-        s['seen_drop_ids'] = list(state['seen_drop_ids'])
-        tmp = STATE_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(s, f)
-        os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        log.error(f"No se pudo guardar estado: {e}")
-
-def load_state():
-    try:
-        if not os.path.exists(STATE_FILE):
-            log.info("No hay estado previo — arranque limpio")
-            return False
-        with open(STATE_FILE) as f:
-            data = json.load(f)
-        data['seen_drop_ids'] = set(data.get('seen_drop_ids', []))
-        for k in state.keys():
-            if k in data:
-                state[k] = data[k]
-        log.info(f"Estado recuperado — base_counter: {state.get('base_counter')}, "
-                 f"drops: {len(state.get('drop_history', []))}")
+    # ── persistencia con backup ──
+    @staticmethod
+    def _sane(data):
+        if not isinstance(data, dict): return False
+        if 'base_counter' not in data: return False
+        bc = data.get('base_counter')
+        if bc is not None and (not isinstance(bc, int) or bc < 0): return False
+        if not isinstance(data.get('group_last_seen', {}), dict): return False
+        if not isinstance(data.get('drop_history', []), list): return False
         return True
-    except Exception as e:
-        log.error(f"No se pudo cargar estado: {e}")
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            s = dict(self.state)
+            s['seen_drop_ids'] = list(self.state['seen_drop_ids'])
+            if s.get('base_counter') is None:
+                return
+            if os.path.exists(self.state_file):
+                try:
+                    os.replace(self.state_file, self.state_file + '.bak')
+                except Exception as e:
+                    log.error(f"[{self.case_id}] backup falló: {e}")
+            tmp = self.state_file + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(s, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            log.error(f"[{self.case_id}] no se pudo guardar: {e}")
+
+    def _load_file(self, path):
+        with open(path) as f:
+            data = json.load(f)
+        if not self._sane(data):
+            raise ValueError("estado no válido")
+        return data
+
+    # Mapa de claves viejas (código mono-caja) → nombre base nuevo, solo caja original
+    LEGACY_KEY_MAP = {
+        'butterfly':    'Butterfly Knife | Case Hardened',
+        'spec_gloves':  'Specialist Gloves | Blackbook',
+        'awp':          "AWP | Queen's Gambit",
+        'sport_gloves': 'Sport Gloves | Frosty',
+        'ak47':         'AK-47 | Vulcan',
+    }
+
+    def _migrate_legacy_keys(self):
+        """Si el estado usa las claves viejas (ak47, butterfly...), las traduce a
+        los nombres base nuevos para no perder el conteo al cambiar de formato."""
+        gls = self.state.get('group_last_seen', {})
+        if not gls:
+            return
+        # ¿Tiene claves viejas?
+        if not any(k in self.LEGACY_KEY_MAP for k in gls):
+            return
+        new_gls, new_probs, new_alerts = {}, {}, {}
+        old_probs = self.state.get('group_probs', {})
+        old_alerts = self.state.get('alerted_levels_ind', {})
+        for old_k, new_k in self.LEGACY_KEY_MAP.items():
+            if old_k in gls:
+                new_gls[new_k] = gls[old_k]
+                if old_k in old_probs:
+                    new_probs[new_k] = old_probs[old_k]
+                if old_k in old_alerts:
+                    new_alerts[new_k] = old_alerts[old_k]
+        # conservar cualquier clave que ya estuviera en formato nuevo
+        for k, v in gls.items():
+            if k not in self.LEGACY_KEY_MAP:
+                new_gls[k] = v
+        self.state['group_last_seen'] = new_gls
+        if new_probs:
+            self.state['group_probs'] = new_probs
+        self.state['alerted_levels_ind'] = new_alerts
+        # traducir las claves en el histórico de drops
+        for d in self.state.get('drop_history', []):
+            if d.get('key') in self.LEGACY_KEY_MAP:
+                d['key'] = self.LEGACY_KEY_MAP[d['key']]
+        log.info(f"[{self.case_id}] migradas claves viejas → nombres base")
+
+    def load(self):
+        for path, label in ((self.state_file, 'principal'), (self.state_file + '.bak', 'backup')):
+            try:
+                if not os.path.exists(path):
+                    continue
+                data = self._load_file(path)
+                data['seen_drop_ids'] = set(data.get('seen_drop_ids', []))
+                for k in self.state.keys():
+                    if k in data:
+                        self.state[k] = data[k]
+                self._migrate_legacy_keys()
+                log.info(f"[{self.case_id}] estado recuperado ({label}) — base: {self.state.get('base_counter')}")
+                if label == 'backup':
+                    send_telegram(f"⚠️ <b>{self.name}: estado principal corrupto</b> — recuperado desde backup.")
+                    self.save()
+                return True
+            except Exception as e:
+                log.error(f"[{self.case_id}] fallo cargando {label}: {e}")
+                continue
+        log.info(f"[{self.case_id}] sin estado previo válido — arranque limpio")
         return False
 
-# ── HISTÓRICO ─────────────────────────────────────────────────────────────────
+    def apply_seed_if_present(self):
+        seed_path = os.path.join(os.path.dirname(self.state_file),
+                                 f'seed_{self.case_id}.json')
+        # compat: la primera caja puede usar el seed.json clásico
+        legacy = os.path.join(os.path.dirname(self.state_file), 'seed.json')
+        if not os.path.exists(seed_path) and self.state_file.endswith('state.json') and os.path.exists(legacy):
+            seed_path = legacy
+        try:
+            if not os.path.exists(seed_path):
+                return False
+            with open(seed_path) as f:
+                data = json.load(f)
+            data['seen_drop_ids'] = set(data.get('seen_drop_ids', []))
+            for k in self.state.keys():
+                if k in data:
+                    self.state[k] = data[k]
+            self.state['initialized'] = True
+            self.save()
+            os.replace(seed_path, seed_path + '.applied')
+            log.info(f"[{self.case_id}] SEED aplicado — base: {self.state.get('base_counter')}")
+            return True
+        except Exception as e:
+            log.error(f"[{self.case_id}] no se pudo aplicar seed: {e}")
+            return False
+
+    # ── fetch con validación de la API ──
+    def warn_api(self, detail):
+        log.error(f"[{self.case_id}] posible cambio API: {detail}")
+        if not self.state.get('api_warned'):
+            self.state['api_warned'] = True
+            send_telegram(f"⚠️ <b>{self.name}: posible cambio en la API</b>\nDetalle: {detail}\n"
+                          f"<i>El monitor sigue intentándolo.</i>")
+
+    def fetch(self):
+        try:
+            r = requests.get(self.api, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+        except Exception as e:
+            log.error(f"[{self.case_id}] fetch error (red): {e}")
+            return None
+        try:
+            payload = r.json()
+        except Exception as e:
+            self.warn_api("respuesta no es JSON")
+            return None
+        d = payload.get('data') if isinstance(payload, dict) else None
+        if not isinstance(d, dict):
+            self.warn_api("falta 'data'"); return None
+        stats = d.get('stats')
+        if not isinstance(stats, dict) or 'opening_count' not in stats:
+            self.warn_api("falta 'stats.opening_count'"); return None
+        counter = stats.get('opening_count')
+        if not isinstance(counter, int) or counter <= 0:
+            self.warn_api(f"opening_count inválido ({counter!r})"); return None
+
+        try:
+            contents = (d.get('last_successful_generation') or {}).get('contents', [])
+            # Detectar raros automáticamente: chance <= RARE_MAX_CHANCE
+            rare_meta = {}   # base_name -> {name, short, prob}
+            for c in contents:
+                try:
+                    nm = c['item']['market_hash_name']
+                    chance = float(c['chance_percent'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if chance <= RARE_MAX_CHANCE:
+                    base = self._base_name(nm)
+                    p = chance / 100.0
+                    if base in rare_meta:
+                        rare_meta[base]['prob'] += p
+                    else:
+                        rare_meta[base] = {'name': base, 'short': self._short_name(base), 'prob': p}
+
+            if contents and not rare_meta:
+                self.warn_api("no se detecta ningún item raro")
+
+            group_probs = {k: v['prob'] for k, v in rare_meta.items()}
+
+            drops = []
+            for t in d.get('top_drops', []):
+                try:
+                    item = (t.get('reason') or {}).get('item') or t.get('item') or {}
+                    nm = item.get('market_hash_name', '')
+                    if not nm:
+                        continue
+                    base = self._base_name(nm)
+                    drops.append({
+                        'name': nm, 'price': t['price'] / 100.0,
+                        'created_at': t.get('created_at', ''), 'drop_id': t.get('id'),
+                        'key': base if base in rare_meta else None,
+                    })
+                except (KeyError, TypeError):
+                    continue
+
+            if self.state.get('api_warned'):
+                self.state['api_warned'] = False
+                send_telegram(f"✅ <b>{self.name}: API normalizada</b>.")
+
+            return {'counter': counter, 'group_probs': group_probs,
+                    'rare_meta': rare_meta, 'drops': drops}
+        except Exception as e:
+            self.warn_api(f"error procesando: {e}")
+            return None
+
+    def initialize(self, data):
+        counter = data['counter']
+        self.state['base_counter'] = counter
+        self.state['last_any_rare'] = counter
+        self.state['group_probs'] = data['group_probs']
+        self.state['rare_meta'] = data['rare_meta']
+        for key in data['rare_meta']:
+            self.state['group_last_seen'][key] = counter
+        self.state['seen_drop_ids'] = set(d['drop_id'] for d in data['drops'])
+        self.state['last_counter'] = counter
+        self.state['last_counter_change_ts'] = time.time()
+        self.state['initialized'] = True
+        seed = [d for d in data['drops'] if d['key'] is not None]
+        seed.sort(key=lambda x: x.get('created_at', ''))
+        self.state['drop_history'] = seed
+        total_p = sum(data['group_probs'].values())
+        expected = round(1 / total_p) if total_p > 0 else 0
+        self.dashboard['expected_every'] = expected
+        log.info(f"[{self.case_id}] inicializado — counter: {counter}, raros: {len(data['rare_meta'])}, prob: {total_p*100:.4f}%")
+        lines = '\n'.join(f"• {m['name']}: {m['prob']*100:.3f}%" for m in data['rare_meta'].values())
+        send_telegram(
+            f"🟢 <b>{self.name} — monitor iniciado</b>\n"
+            f"Counter base: <code>{counter:,}</code>\n"
+            f"Raro esperado cada ~{expected:,} cajas\n\n"
+            f"<b>Items raros detectados:</b>\n{lines}"
+        )
+
+    def compute_history(self, now_dt):
+        hist = self.state['drop_history']
+        parsed = [(parse_dt(d.get('created_at', '')), d) for d in hist]
+        parsed = [(dt, d) for (dt, d) in parsed if dt]
+        parsed.sort(key=lambda x: x[0])
+        def within(hours):
+            cutoff = now_dt.timestamp() - hours * 3600
+            return [d for (dt, d) in parsed if dt.timestamp() >= cutoff]
+        last24, last48 = within(24), within(48)
+        by_item_24 = {}
+        for d in last24:
+            by_item_24[d['key']] = by_item_24.get(d['key'], 0) + 1
+        intervals = [(parsed[i][0]-parsed[i-1][0]).total_seconds()/3600 for i in range(1, len(parsed))]
+        avg_gap_h = round(sum(intervals)/len(intervals), 1) if intervals else None
+        hours_since_last = round((now_dt.timestamp()-parsed[-1][0].timestamp())/3600, 1) if parsed else None
+        span_h = round((parsed[-1][0].timestamp()-parsed[0][0].timestamp())/3600, 1) if len(parsed) >= 2 else None
+        timeline = [{'name': d['name'], 'price': f"${d['price']:.2f}",
+                     'created_at': d['created_at'], 'key': d['key'],
+                     'pressure_individual': d.get('pressure_individual'),
+                     'pressure_combined': d.get('pressure_combined'),
+                     'boxes_individual': d.get('boxes_individual'),
+                     'boxes_combined': d.get('boxes_combined')} for (dt, d) in reversed(parsed)]
+        stats = {'count_24h': len(last24), 'count_48h': len(last48), 'by_item_24h': by_item_24,
+                 'avg_gap_h': avg_gap_h, 'hours_since_last': hours_since_last,
+                 'span_h': span_h, 'total_tracked': len(parsed)}
+        return stats, timeline
+
+    def process(self, data):
+        counter = data['counter']
+        drops = data['drops']
+        now = time.time()
+        now_dt = datetime.utcnow()
+        st = self.state
+
+        if not st['initialized']:
+            self.initialize(data)
+
+        # guardia anti-retroceso
+        if st.get('last_counter') is not None and counter < st['last_counter']:
+            drop_amount = st['last_counter'] - counter
+            log.error(f"[{self.case_id}] counter retrocedió -{drop_amount}, ignorando ciclo")
+            if drop_amount > 100 and not st.get('api_warned'):
+                self.warn_api(f"el contador retrocedió {drop_amount:,} cajas")
+            return
+
+        # actualizar probabilidades y meta de raros
+        if data['group_probs']:
+            st['group_probs'] = data['group_probs']
+        if data.get('rare_meta'):
+            st['rare_meta'] = data['rare_meta']
+
+        # caja muerta
+        if st['last_counter'] is None:
+            st['last_counter'] = counter; st['last_counter_change_ts'] = now
+        elif counter > st['last_counter']:
+            st['last_counter'] = counter; st['last_counter_change_ts'] = now
+            st['dead_alerted'] = False
+        else:
+            stalled_min = (now - (st['last_counter_change_ts'] or now)) / 60
+            if stalled_min >= DEAD_AFTER_MIN and not st['dead_alerted']:
+                st['dead_alerted'] = True
+                send_telegram(f"💀 <b>{self.name}: POSIBLE CAJA MUERTA</b>\n"
+                              f"El contador no sube desde hace {int(stalled_min)} min.\n"
+                              f"Counter: <code>{counter:,}</code>")
+        dead_now = st['dead_alerted']
+
+        # drops nuevos
+        new_drops = [d for d in drops if d['drop_id'] not in st['seen_drop_ids']]
+        new_rares = [d for d in new_drops if d['key'] is not None]
+        for d in drops:
+            st['seen_drop_ids'].add(d['drop_id'])
+        if len(st['seen_drop_ids']) > 500:
+            st['seen_drop_ids'] = set(d['drop_id'] for d in drops)
+
+        if new_rares:
+            log.info(f"[{self.case_id}] nuevos raros: {[d['name'] for d in new_rares]}")
+
+        # presión en el momento del drop
+        total_p_now = sum(st['group_probs'].values())
+        for d in new_rares:
+            key = d['key']
+            p_item = st['group_probs'].get(key, 0)
+            last_seen_item = st['group_last_seen'].get(key, st['base_counter'])
+            n_item = max(0, counter - last_seen_item)
+            last_any = st['last_any_rare'] or st['base_counter']
+            n_any = max(0, counter - last_any)
+            d['pressure_individual'] = round(prob_acum(p_item, n_item), 1)
+            d['pressure_combined'] = round(combined_prob(total_p_now, n_any), 1)
+            d['boxes_individual'] = n_item
+            d['boxes_combined'] = n_any
+
+        for d in new_rares:
+            st['group_last_seen'][d['key']] = counter
+            st['drop_history'].append(d)
+        if new_rares:
+            st['last_any_rare'] = counter
+        st['drop_history'].sort(key=lambda x: x.get('created_at', ''))
+        if len(st['drop_history']) > 300:
+            st['drop_history'] = st['drop_history'][-300:]
+
+        # presiones por item raro
+        hot_items = []
+        for key, meta in st['rare_meta'].items():
+            p = st['group_probs'].get(key, 0)
+            last_seen = st['group_last_seen'].get(key, st['base_counter'])
+            n = max(0, counter - last_seen)
+            hot_items.append({'key': key, 'name': meta['name'], 'short': meta['short'],
+                              'prob': p, 'n': n, 'pct': prob_acum(p, n)})
+        hot_items.sort(key=lambda x: -x['pct'])
+
+        total_p = sum(st['group_probs'].values())
+        boxes_since_any = max(0, counter - (st['last_any_rare'] or st['base_counter']))
+        combined_pct = combined_prob(total_p, boxes_since_any)
+        expected = round(1 / total_p) if total_p > 0 else 0
+
+        # snapshot gráfica (1 cada 30 min, ventana 14 días)
+        SNAP_MIN, SNAP_DAYS = 30, 14
+        snaps = st['pressure_snapshots']
+        now_iso = now_dt.replace(tzinfo=timezone.utc).isoformat()
+        add = True
+        if snaps:
+            try:
+                last_t = datetime.fromisoformat(snaps[-1]['t'].replace('Z', '+00:00'))
+                if (now_dt.replace(tzinfo=timezone.utc) - last_t).total_seconds() < SNAP_MIN*60:
+                    add = False
+            except Exception:
+                add = True
+        if add:
+            snaps.append({'t': now_iso, 'counter': counter, 'combined_pct': round(combined_pct, 2)})
+            cutoff = now_dt.replace(tzinfo=timezone.utc).timestamp() - SNAP_DAYS*86400
+            kept = []
+            for s in snaps:
+                try:
+                    if datetime.fromisoformat(s['t'].replace('Z', '+00:00')).timestamp() >= cutoff:
+                        kept.append(s)
+                except Exception:
+                    kept.append(s)
+            st['pressure_snapshots'] = kept[-1500:]
+
+        hist_stats, timeline = self.compute_history(now_dt)
+        self.dashboard.update({
+            'counter': counter, 'updated': now_dt.isoformat() + 'Z',
+            'combined_pct': round(combined_pct, 2), 'boxes_since_any': boxes_since_any,
+            'expected_every': expected,
+            'hot_items': [{'key': i['key'], 'name': i['name'], 'short': i['short'],
+                           'n': i['n'], 'pct': round(i['pct'], 2),
+                           'prob': round(i['prob']*100, 4),
+                           'expected_every': round(1/i['prob']) if i['prob'] > 0 else 0} for i in hot_items],
+            'history_24h': timeline, 'history_stats': hist_stats,
+            'pressure_series': st['pressure_snapshots'],
+            'kpis': {'total_prob_pct': round(total_p*100, 4)},
+            'status': 'activo' if not dead_now else 'caja muerta', 'dead': dead_now,
+        })
+
+        if st['initialized']:
+            self._alerts(hot_items, combined_pct, boxes_since_any, expected, counter, new_rares)
+        self.save()
+
+    def _alerts(self, hot_items, combined_pct, boxes_since_any, expected, counter, new_rares):
+        st = self.state
+        for item in hot_items:
+            key, pct = item['key'], item['pct']
+            fired = st['alerted_levels_ind'].get(key, [])
+            if pct < ALERT_LEVELS[0]:
+                if fired:
+                    st['alerted_levels_ind'][key] = []
+                continue
+            for lvl in ALERT_LEVELS:
+                if pct >= lvl and lvl not in fired:
+                    fired.append(lvl)
+                    st['alerted_levels_ind'][key] = fired
+                    send_telegram(f"🔥 <b>{self.name} · {item['name']} — supera {lvl:.0f}%</b>\n\n"
+                                  f"Probabilidad acumulada: <b>{pct:.1f}%</b>\n"
+                                  f"Cajas sin caer: <code>{item['n']:,}</code>\n"
+                                  f"Counter: <code>{counter:,}</code>")
+        fired_c = st['alerted_levels_comb']
+        if combined_pct < ALERT_LEVELS[0]:
+            if fired_c:
+                st['alerted_levels_comb'] = []
+        else:
+            for lvl in ALERT_LEVELS:
+                if combined_pct >= lvl and lvl not in fired_c:
+                    fired_c.append(lvl)
+                    st['alerted_levels_comb'] = fired_c
+                    bars = ''.join(f"{'🔴' if i['pct']>=90 else '🟡' if i['pct']>=70 else '⚪'} {i['short']}: {i['pct']:.1f}%\n" for i in hot_items[:8])
+                    send_telegram(f"⚠️ <b>{self.name}: SEQUÍA GLOBAL — supera {lvl:.0f}%</b>\n\n"
+                                  f"Presión combinada: <b>{combined_pct:.1f}%</b>\n"
+                                  f"<code>{boxes_since_any:,}</code> cajas sin ningún raro\n"
+                                  f"(esperado cada ~{expected:,})\n\n{bars}")
+        for d in new_rares:
+            pi, pc = d.get('pressure_individual'), d.get('pressure_combined')
+            press = f"Presión al caer — global: <b>{pc}%</b> · item: <b>{pi}%</b>\n" if (pi is not None or pc is not None) else ""
+            send_telegram(f"✅ <b>{self.name}: DROP — {d['name']}</b>\n"
+                          f"Precio: ${d['price']:.2f} · Counter: <code>{counter:,}</code>\n"
+                          f"{press}<i>Contador de {self.group_name(d['key'])} reseteado</i>")
+
+    def do_check(self):
+        data = self.fetch()
+        if data and data.get('counter'):
+            with self.lock:
+                self.process(data)
+            return True
+        return False
+
+# ── HELPERS GLOBALES ──────────────────────────────────────────────────────────
 def parse_dt(s):
     try:
         return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
     except Exception:
         return None
 
-def compute_history(now_dt):
-    hist = state['drop_history']
-    parsed = [(parse_dt(d.get('created_at', '')), d) for d in hist]
-    parsed = [(dt, d) for (dt, d) in parsed if dt]
-    parsed.sort(key=lambda x: x[0])
+# Registro de monitores (uno por caja)
+MONITORS = {}   # case_id -> CaseMonitor
+def build_monitors():
+    for c in CASES:
+        MONITORS[c['id']] = CaseMonitor(c['id'], c['name'], c['state_file'])
 
-    def within(hours):
-        cutoff = now_dt.timestamp() - hours * 3600
-        return [d for (dt, d) in parsed if dt.timestamp() >= cutoff]
+def get_monitor(case_id):
+    return MONITORS.get(case_id)
 
-    last24, last48 = within(24), within(48)
-    by_item_24 = {}
-    for d in last24:
-        by_item_24[d['key']] = by_item_24.get(d['key'], 0) + 1
+# ── TELEGRAM: comandos con selección de caja ──────────────────────────────────
+def cases_keyboard(action):
+    # Un botón por caja para un comando dado (estado/historico)
+    rows = [[{'text': m.name, 'callback_data': f'{action}:{cid}'}] for cid, m in MONITORS.items()]
+    return {'inline_keyboard': rows}
 
-    intervals = [(parsed[i][0] - parsed[i-1][0]).total_seconds()/3600 for i in range(1, len(parsed))]
-    avg_gap_h = round(sum(intervals)/len(intervals), 1) if intervals else None
-    hours_since_last = round((now_dt.timestamp() - parsed[-1][0].timestamp())/3600, 1) if parsed else None
-    span_h = round((parsed[-1][0].timestamp() - parsed[0][0].timestamp())/3600, 1) if len(parsed) >= 2 else None
+def menu_keyboard():
+    rows = []
+    for cid, m in MONITORS.items():
+        rows.append([
+            {'text': f'📊 {m.name}', 'callback_data': f'status:{cid}'},
+            {'text': '🌐', 'url': m.web},
+        ])
+    rows.append([{'text': '🔄 Check todas', 'callback_data': 'checkall'}])
+    return {'inline_keyboard': rows}
 
-    timeline = [{'name': d['name'], 'price': f"${d['price']:.2f}",
-                 'created_at': d['created_at'], 'key': d['key'],
-                 'pressure_individual': d.get('pressure_individual'),
-                 'pressure_combined': d.get('pressure_combined'),
-                 'boxes_individual': d.get('boxes_individual'),
-                 'boxes_combined': d.get('boxes_combined')} for (dt, d) in reversed(parsed)]
-
-    stats = {'count_24h': len(last24), 'count_48h': len(last48), 'by_item_24h': by_item_24,
-             'avg_gap_h': avg_gap_h, 'hours_since_last': hours_since_last,
-             'span_h': span_h, 'total_tracked': len(parsed)}
-    return stats, timeline
-
-# ── DASHBOARD SNAPSHOT ────────────────────────────────────────────────────────
-dashboard = {
-    'counter': None, 'updated': None, 'combined_pct': 0, 'boxes_since_any': 0,
-    'hot_items': [], 'expected_every': 0, 'check_interval': CHECK_INTERVAL,
-    'status': 'arrancando', 'history_24h': [], 'history_stats': {},
-    'pressure_series': [], 'kpis': {}, 'case_url': CASE_WEB_URL,
-    'dead': False,
-    # Lista de cajas monitorizadas (por ahora una). La Home la usa para el menú.
-    'cases': [{'id': CASE_ID, 'name': CASE_NAME, 'url': CASE_WEB_URL}],
-    'active_case': {'id': CASE_ID, 'name': CASE_NAME, 'url': CASE_WEB_URL},
-}
-
-def initialize(data):
-    counter = data['counter']
-    state['base_counter']   = counter
-    state['last_any_rare']  = counter
-    state['group_probs']    = data['group_probs']
-    for g in RARE_GROUPS:
-        state['group_last_seen'][g['key']] = counter
-    state['seen_drop_ids']  = set(d['drop_id'] for d in data['drops'])
-    state['last_counter']   = counter
-    state['last_counter_change_ts'] = time.time()
-    state['initialized']    = True
-
-    seed = [d for d in data['drops'] if d['key'] is not None]
-    seed.sort(key=lambda x: x.get('created_at', ''))
-    state['drop_history'] = seed
-
-    total_p = sum(data['group_probs'].values())
-    expected = round(1 / total_p) if total_p > 0 else 0
-    dashboard['expected_every'] = expected
-
-    log.info(f"Inicializado — counter: {counter}, prob total: {total_p*100:.4f}%")
-    lines = '\n'.join(f"• {g['name']}: {state['group_probs'][g['key']]*100:.3f}%" for g in RARE_GROUPS)
-    send_telegram(
-        f"🟢 <b>CS2 Monitor iniciado</b>\n"
-        f"Counter base: <code>{counter:,}</code>\n"
-        f"Drop raro esperado cada ~{expected:,} cajas\n\n"
-        f"<b>Probabilidades:</b>\n{lines}"
-    )
-
-def process(data):
-    counter = data['counter']
-    drops   = data['drops']
-    now     = time.time()
-    now_dt  = datetime.utcnow()
-
-    if not state['initialized']:
-        initialize(data)
-
-    if data['group_probs']:
-        state['group_probs'] = data['group_probs']
-
-    # ── Detección de caja muerta ────────────────────────────────────────────
-    if state['last_counter'] is None:
-        state['last_counter'] = counter
-        state['last_counter_change_ts'] = now
-    elif counter > state['last_counter']:
-        state['last_counter'] = counter
-        state['last_counter_change_ts'] = now
-        state['dead_alerted'] = False
-    else:
-        stalled_min = (now - (state['last_counter_change_ts'] or now)) / 60
-        if stalled_min >= DEAD_AFTER_MIN and not state['dead_alerted']:
-            state['dead_alerted'] = True
-            send_telegram(
-                f"💀 <b>POSIBLE CAJA MUERTA</b>\n"
-                f"El contador no sube desde hace {int(stalled_min)} min.\n"
-                f"Counter: <code>{counter:,}</code>\n"
-                f"<i>¿Se ha retirado la caja o cambió la API?</i>"
-            )
-
-    dead_now = state['dead_alerted']
-
-    # ── Drops nuevos ────────────────────────────────────────────────────────
-    new_drops = [d for d in drops if d['drop_id'] not in state['seen_drop_ids']]
-    new_rares = [d for d in new_drops if d['key'] is not None]
-    for d in drops:
-        state['seen_drop_ids'].add(d['drop_id'])
-    if len(state['seen_drop_ids']) > 500:
-        state['seen_drop_ids'] = set(d['drop_id'] for d in drops)
-
-    if new_rares:
-        log.info(f"Nuevos raros: {[d['name'] for d in new_rares]}")
-
-    # Calcular la presión que tenía cada drop JUSTO ANTES de caer (antes de resetear).
-    # Esto se guarda en el propio drop para mostrarlo luego en el histórico.
-    total_p_now = sum(state['group_probs'].values())
-    for d in new_rares:
-        key = d['key']
-        p_item = state['group_probs'].get(key, 0)
-        # cajas que llevaba ese item sin caer, en el momento del drop
-        last_seen_item = state['group_last_seen'].get(key, state['base_counter'])
-        n_item = max(0, counter - last_seen_item)
-        # cajas sin caer ningún raro, en el momento del drop
-        last_any = state['last_any_rare'] or state['base_counter']
-        n_any = max(0, counter - last_any)
-        d['pressure_individual'] = round(prob_acum(p_item, n_item), 1)
-        d['pressure_combined']   = round(combined_prob(total_p_now, n_any), 1)
-        d['boxes_individual']    = n_item
-        d['boxes_combined']      = n_any
-
-    for d in new_rares:
-        state['group_last_seen'][d['key']] = counter
-        state['drop_history'].append(d)
-    if new_rares:
-        state['last_any_rare'] = counter
-
-    state['drop_history'].sort(key=lambda x: x.get('created_at', ''))
-    if len(state['drop_history']) > 300:
-        state['drop_history'] = state['drop_history'][-300:]
-
-    # ── Presiones ────────────────────────────────────────────────────────────
-    hot_items = []
-    for g in RARE_GROUPS:
-        p = state['group_probs'].get(g['key'], 0)
-        last_seen = state['group_last_seen'].get(g['key'], state['base_counter'])
-        n = max(0, counter - last_seen)
-        hot_items.append({**g, 'prob': p, 'n': n, 'pct': prob_acum(p, n)})
-
-    total_p = sum(state['group_probs'].values())
-    boxes_since_any = max(0, counter - (state['last_any_rare'] or state['base_counter']))
-    combined_pct = combined_prob(total_p, boxes_since_any)
-    expected = round(1 / total_p) if total_p > 0 else 0
-
-    # ── Snapshot de presión para la gráfica ─────────────────────────────────
-    # Para cubrir 14 días sin acumular demasiados puntos, guardamos como mucho
-    # un snapshot cada SNAPSHOT_EVERY_MIN minutos. 14 días a 1/30min = ~672 puntos.
-    SNAPSHOT_EVERY_MIN = 30
-    SNAPSHOT_WINDOW_DAYS = 14
-    snaps = state['pressure_snapshots']
-    now_iso = now_dt.replace(tzinfo=timezone.utc).isoformat()
-    add = True
-    if snaps:
-        try:
-            last_t = datetime.fromisoformat(snaps[-1]['t'].replace('Z', '+00:00'))
-            if (now_dt.replace(tzinfo=timezone.utc) - last_t).total_seconds() < SNAPSHOT_EVERY_MIN * 60:
-                add = False
-        except Exception:
-            add = True
-    if add:
-        snaps.append({'t': now_iso, 'counter': counter, 'combined_pct': round(combined_pct, 2)})
-        # podar a la ventana de 14 días
-        cutoff = now_dt.replace(tzinfo=timezone.utc).timestamp() - SNAPSHOT_WINDOW_DAYS * 86400
-        kept = []
-        for s in snaps:
-            try:
-                ts = datetime.fromisoformat(s['t'].replace('Z', '+00:00')).timestamp()
-                if ts >= cutoff:
-                    kept.append(s)
-            except Exception:
-                kept.append(s)
-        state['pressure_snapshots'] = kept
-
-    # ── KPIs ─────────────────────────────────────────────────────────────────
-    hist_stats, timeline = compute_history(now_dt)
-    kpis = {
-        'total_prob_pct': round(total_p * 100, 4),
-    }
-
-    dashboard.update({
-        'counter': counter,
-        'updated': now_dt.isoformat() + 'Z',
-        'combined_pct': round(combined_pct, 2),
-        'boxes_since_any': boxes_since_any,
-        'expected_every': expected,
-        'hot_items': [{'key': i['key'], 'name': i['name'], 'short': i['short'],
-                       'n': i['n'], 'pct': round(i['pct'], 2),
-                       'prob': round(i['prob']*100, 4),
-                       'expected_every': round(1/i['prob']) if i['prob'] > 0 else 0} for i in hot_items],
-        'history_24h': timeline,
-        'history_stats': hist_stats,
-        'pressure_series': state['pressure_snapshots'],  # ventana de 14 días
-        'kpis': kpis,
-        'status': 'activo' if not dead_now else 'caja muerta',
-        'dead': dead_now,
-    })
-
-    items_summary = ', '.join(i['short'] + ':' + str(round(i['pct'],1)) + '%' for i in hot_items)
-    log.info(f"Counter: {counter} | Comb: {combined_pct:.1f}% ({boxes_since_any}) | {items_summary}")
-
-    if state['initialized']:
-        # ── Alertas individuales por niveles (90, 95) ──
-        # Avisa una sola vez al cruzar cada nivel. Se rearma cuando la presión
-        # cae por debajo del nivel más bajo (al caer un drop y resetearse).
-        for item in hot_items:
-            key = item['key']
-            pct = item['pct']
-            fired = state['alerted_levels_ind'].get(key, [])
-            # rearmar: si la presión bajó del nivel más bajo, olvidar lo avisado
-            if pct < ALERT_LEVELS[0]:
-                if fired:
-                    state['alerted_levels_ind'][key] = []
-                continue
-            # avisar de cada nivel cruzado que no se haya avisado aún
-            for lvl in ALERT_LEVELS:
-                if pct >= lvl and lvl not in fired:
-                    fired.append(lvl)
-                    state['alerted_levels_ind'][key] = fired
-                    send_telegram(
-                        f"🔥 <b>{item['name']} — supera {lvl:.0f}%</b>\n\n"
-                        f"Probabilidad acumulada: <b>{pct:.1f}%</b>\n"
-                        f"Cajas sin caer: <code>{item['n']:,}</code>\n"
-                        f"Counter: <code>{counter:,}</code>"
-                    )
-
-        # ── Alerta sequía global por niveles ──
-        fired_c = state['alerted_levels_comb']
-        if combined_pct < ALERT_LEVELS[0]:
-            if fired_c:
-                state['alerted_levels_comb'] = []
-        else:
-            for lvl in ALERT_LEVELS:
-                if combined_pct >= lvl and lvl not in fired_c:
-                    fired_c.append(lvl)
-                    state['alerted_levels_comb'] = fired_c
-                    bars = ''.join(
-                        f"{'🔴' if i['pct']>=90 else '🟡' if i['pct']>=70 else '⚪'} {i['short']}: {i['pct']:.1f}%\n"
-                        for i in hot_items
-                    )
-                    send_telegram(
-                        f"⚠️ <b>SEQUÍA GLOBAL — supera {lvl:.0f}%</b>\n\n"
-                        f"Presión combinada: <b>{combined_pct:.1f}%</b>\n"
-                        f"<code>{boxes_since_any:,}</code> cajas sin ningún raro\n"
-                        f"(esperado cada ~{expected:,})\n\n{bars}"
-                    )
-        # Drops nuevos
-        for d in new_rares:
-            pi = d.get('pressure_individual')
-            pc = d.get('pressure_combined')
-            press_line = ""
-            if pi is not None or pc is not None:
-                press_line = (f"Presión al caer — global: <b>{pc}%</b> · "
-                              f"item: <b>{pi}%</b>\n")
-            send_telegram(
-                f"✅ <b>DROP — {d['name']}</b>\n"
-                f"Precio: ${d['price']:.2f} · Counter: <code>{counter:,}</code>\n"
-                f"{press_line}"
-                f"<i>Contador de {group_name(d['key'])} reseteado</i>"
-            )
-
-    save_state()
-
-# ── COMANDOS DE TELEGRAM (long polling en hilo aparte) ────────────────────────
-def telegram_status_text():
-    d = dashboard
+def status_text(m):
+    d = m.dashboard
     if not d.get('counter'):
-        return "⏳ Aún sin datos. Espera al primer check."
-    lines = [f"📊 <b>Estado actual</b>",
+        return f"⏳ {m.name}: aún sin datos."
+    lines = [f"📊 <b>{m.name}</b>",
              f"Counter: <code>{d['counter']:,}</code>",
-             f"Sequía global: <b>{d['combined_pct']:.1f}%</b> ({d['boxes_since_any']:,} cajas)",
-             ""]
-    for i in d['hot_items']:
+             f"Sequía global: <b>{d['combined_pct']:.1f}%</b> ({d['boxes_since_any']:,} cajas)", ""]
+    for i in d['hot_items'][:8]:
         emoji = '🔴' if i['pct']>=90 else '🟡' if i['pct']>=70 else '⚪'
-        lines.append(f"{emoji} {i['short']}: {i['pct']:.1f}% · {i['n']:,} cajas")
+        lines.append(f"{emoji} {i['short']}: {i['pct']:.1f}% · {i['n']:,}")
     hs = d.get('history_stats', {})
     if hs:
         lines.append("")
         lines.append(f"24h: {hs.get('count_24h',0)} raros · último hace {hs.get('hours_since_last','?')}h")
     return '\n'.join(lines)
 
-def control_keyboard():
-    return {'inline_keyboard': [
-        [{'text': '📊 Estado', 'callback_data': 'status'},
-         {'text': '🔄 Check ahora', 'callback_data': 'check'}],
-        [{'text': '📜 Histórico', 'callback_data': 'history'},
-         {'text': '🌐 Ir a la caja', 'url': CASE_WEB_URL}],
-    ]}
-
-def telegram_history_text():
-    d = dashboard
+def history_text(m):
+    d = m.dashboard
     hs = d.get('history_stats', {})
     tl = d.get('history_24h', [])[:12]
     if not tl:
-        return "Sin histórico aún."
-    lines = [f"📜 <b>Histórico de drops</b>",
-             f"Total registrados: {hs.get('total_tracked',0)} · 24h: {hs.get('count_24h',0)}",
-             f"Intervalo medio: {hs.get('avg_gap_h','?')}h · último hace {hs.get('hours_since_last','?')}h", ""]
+        return f"{m.name}: sin histórico aún."
+    lines = [f"📜 <b>{m.name} — histórico</b>",
+             f"Total: {hs.get('total_tracked',0)} · 24h: {hs.get('count_24h',0)} · medio {hs.get('avg_gap_h','?')}h", ""]
     for x in tl:
         lines.append(f"• {to_madrid(x['created_at'])} — {x['name']} ({x['price']})")
     return '\n'.join(lines)
@@ -509,38 +646,46 @@ def answer_callback(cb_id, text=None):
 
 def handle_command(text, chat_id):
     if str(chat_id) != TELEGRAM_CHAT_ID:
-        return  # solo responde al dueño
+        return
     cmd = text.strip().lower().lstrip('/')
     if cmd in ('start', 'menu', 'help', 'ayuda'):
-        send_telegram("🎛 <b>Panel de control</b>\nUsa los botones:", control_keyboard())
-    elif cmd in ('status', 'estado'):
-        send_telegram(telegram_status_text(), control_keyboard())
+        send_telegram("🎛 <b>Panel de control</b>\nElige una caja:", menu_keyboard())
+    elif cmd in ('estado', 'status'):
+        send_telegram("¿De qué caja quieres el estado?", cases_keyboard('status'))
+    elif cmd in ('historico', 'histórico', 'history'):
+        send_telegram("¿De qué caja quieres el histórico?", cases_keyboard('history'))
     elif cmd in ('check', 'forzar'):
-        control['force_check'] = True
-        send_telegram("🔄 Check forzado en marcha...")
-    elif cmd in ('history', 'historico', 'histórico'):
-        send_telegram(telegram_history_text())
+        for m in MONITORS.values():
+            m.control['force_check'] = True
+        send_telegram("🔄 Check forzado en todas las cajas...")
     else:
-        send_telegram("No reconozco ese comando. Pulsa /menu para ver las opciones.")
+        send_telegram("No reconozco ese comando. Pulsa /menu.")
 
 def handle_callback(data, cb_id, chat_id):
     if str(chat_id) != TELEGRAM_CHAT_ID:
-        answer_callback(cb_id)
+        answer_callback(cb_id); return
+    if data == 'checkall':
+        for m in MONITORS.values():
+            m.control['force_check'] = True
+        answer_callback(cb_id, "Check en todas")
+        send_telegram("🔄 Check forzado en todas las cajas...")
         return
-    if data == 'status':
+    if ':' in data:
+        action, cid = data.split(':', 1)
+        m = get_monitor(cid)
+        if not m:
+            answer_callback(cb_id); return
+        if action == 'status':
+            answer_callback(cb_id); send_telegram(status_text(m), menu_keyboard())
+        elif action == 'history':
+            answer_callback(cb_id); send_telegram(history_text(m))
+        else:
+            answer_callback(cb_id)
+    else:
         answer_callback(cb_id)
-        send_telegram(telegram_status_text(), control_keyboard())
-    elif data == 'check':
-        control['force_check'] = True
-        answer_callback(cb_id, "Check forzado")
-        send_telegram("🔄 Check forzado en marcha...")
-    elif data == 'history':
-        answer_callback(cb_id)
-        send_telegram(telegram_history_text())
 
 def telegram_poll_loop():
     offset = None
-    # purgar updates antiguos al arrancar
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
                          params={'timeout': 0}, timeout=15).json()
@@ -558,7 +703,7 @@ def telegram_poll_loop():
                     handle_command(upd['message']['text'], upd['message']['chat']['id'])
                 elif 'callback_query' in upd:
                     cq = upd['callback_query']
-                    handle_callback(cq.get('data',''), cq['id'], cq['message']['chat']['id'])
+                    handle_callback(cq.get('data', ''), cq['id'], cq['message']['chat']['id'])
         except Exception as e:
             log.error(f"Telegram poll error: {e}")
             time.sleep(5)
@@ -766,17 +911,15 @@ function showDetail(caseId){
   document.getElementById('live').style.visibility='visible';
   load();
 }
-function renderHome(d){
-  const cases=d.cases||[];
-  const cur=(selectedCaseId)||null;
-  // por ahora la métrica de cada caja viene del dashboard activo
+function renderHome(payload){
+  const cases=payload.cases||[];
   document.getElementById('caseList').innerHTML=cases.map(c=>{
-    const isActive=d.active_case&&d.active_case.id===c.id;
-    const pct=isActive?(d.combined_pct||0):null;
+    const pct=(c.combined_pct!=null)?c.combined_pct:null;
     const z=pct!=null?zone(pct):'';
     const col=z==='hot'?'var(--red)':z==='warm'?'var(--or)':'var(--cy)';
     const pctTxt=pct!=null?pct.toFixed(1)+'%':'—';
-    const meta=isActive?(nf(d.boxes_since_any||0)+' cajas sin raro · '+(d.counter?nf(d.counter):'—')+' abiertas'):'monitor activo';
+    const dead=c.dead?' 💀':'';
+    const meta=(c.counter)?(nf(c.boxes_since_any||0)+' cajas sin raro · '+nf(c.counter)+' abiertas'+dead):'arrancando...';
     return `<div class="case-card" data-case="${c.id}">
       <div class="case-info"><div class="case-name">${c.name}</div><div class="case-meta">${meta}</div></div>
       <div class="case-pct" style="color:${col}">${pctTxt}</div>
@@ -816,12 +959,15 @@ function drawChart(series){
 
 async function load(){
   try{
-    const d=await(await fetch('/data')).json();
-    // La Home siempre se mantiene actualizada
-    renderHome(d);
+    const payload=await(await fetch('/data')).json();
+    // La Home siempre se mantiene actualizada con todas las cajas
+    renderHome(payload);
     // Si estamos en la Home, no hace falta pintar el detalle
     if(currentView!=='detail'){return;}
-    document.getElementById('mainTitle').textContent=(d.active_case&&d.active_case.name)?d.active_case.name.toUpperCase():'CS2 CASE MONITOR';
+    // Buscar la caja seleccionada dentro del payload
+    const d=(payload.cases||[]).find(c=>c.id===selectedCaseId);
+    if(!d){return;}
+    document.getElementById('mainTitle').textContent=(d.name||'CS2 CASE MONITOR').toUpperCase();
     const cls=zone(d.combined_pct);
     document.getElementById('cCard').className='combined '+cls;
     document.getElementById('cPct').className='cmb-big '+cls;
@@ -912,14 +1058,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body))); self.end_headers()
         self.wfile.write(body)
     def do_POST(self):
-        if self.path == '/action/check':
-            control['force_check'] = True
+        # /action/check/<case_id>  o  /action/check (todas)
+        if self.path.startswith('/action/check'):
+            parts = self.path.split('/')
+            cid = parts[3] if len(parts) > 3 and parts[3] else None
+            if cid and get_monitor(cid):
+                get_monitor(cid).control['force_check'] = True
+            else:
+                for m in MONITORS.values():
+                    m.control['force_check'] = True
             self._json({'ok': True})
         else:
             self._json({'ok': False}, 404)
     def do_GET(self):
-        if self.path == '/data':
-            self._json(dashboard)
+        if self.path == '/data' or self.path.startswith('/data?'):
+            # Payload con todas las cajas
+            self._json({'cases': [m.dashboard for m in MONITORS.values()]})
         else:
             body = DASHBOARD_HTML.encode()
             self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8')
@@ -929,75 +1083,59 @@ class Handler(BaseHTTPRequestHandler):
 def start_web():
     HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
 
-# ── LOOP ──────────────────────────────────────────────────────────────────────
-def do_check():
-    data = fetch_data()
-    if data and data.get('counter'):
-        process(data)
-        return True
-    return False
-
-def apply_seed_if_present():
-    """Si existe un seed.json (estado inicial manual), lo aplica con prioridad
-    sobre el state.json y luego lo renombra para no reaplicarlo. Esto permite
-    sembrar el estado sin pelearse con el guardado automático del monitor."""
-    seed_path = os.path.join(os.path.dirname(STATE_FILE), 'seed.json')
-    try:
-        if not os.path.exists(seed_path):
-            return False
-        with open(seed_path) as f:
-            data = json.load(f)
-        data['seen_drop_ids'] = set(data.get('seen_drop_ids', []))
-        for k in state.keys():
-            if k in data:
-                state[k] = data[k]
-        state['initialized'] = True
-        save_state()  # persistir inmediatamente como state.json oficial
-        os.replace(seed_path, seed_path + '.applied')  # marcar como aplicado
-        log.info(f"SEED aplicado — base: {state.get('base_counter')}, drops: {len(state.get('drop_history', []))}")
-        return True
-    except Exception as e:
-        log.error(f"No se pudo aplicar seed: {e}")
-        return False
-
-def main():
-    log.info("CS2 Monitor (API) arrancando...")
-    threading.Thread(target=start_web, daemon=True).start()
-    threading.Thread(target=telegram_poll_loop, daemon=True).start()
-
-    # Prioridad: si hay seed.json, lo aplica (estado inicial manual)
-    seeded = apply_seed_if_present()
-    recovered = seeded or load_state()
-    if recovered and state.get('base_counter'):
-        send_telegram(
-            f"♻️ <b>Monitor reanudado</b>\n"
-            f"Counter base: <code>{state['base_counter']:,}</code>\n"
-            f"Drops en histórico: {len(state.get('drop_history', []))}\n"
-            f"<i>{'Estado inicial aplicado.' if seeded else 'No se ha perdido el conteo.'}</i>", control_keyboard()
-        )
-    else:
-        send_telegram("⏳ <b>CS2 Monitor desplegado</b> — conectando...")
-
-    fails = 0
+# ── LOOP PRINCIPAL ────────────────────────────────────────────────────────────
+def case_loop(m):
+    """Hilo por caja: chequea cada CHECK_INTERVAL, respeta force_check."""
     last_check = 0
+    fails = 0
     while True:
         now = time.time()
         due = (now - last_check) >= CHECK_INTERVAL
-        forced = control['force_check']
+        forced = m.control['force_check']
         if due or forced:
             if forced:
-                control['force_check'] = False
-                log.info("Check forzado")
-            ok = do_check()
+                m.control['force_check'] = False
+                log.info(f"[{m.case_id}] check forzado")
+            ok = m.do_check()
             last_check = time.time()
             if ok:
                 fails = 0
             else:
                 fails += 1
-                dashboard['status'] = 'sin datos'
+                m.dashboard['status'] = 'sin datos'
                 if fails == 3:
-                    send_telegram("⚠️ <b>Aviso:</b> 3 fallos seguidos leyendo la API.")
+                    send_telegram(f"⚠️ <b>{m.name}:</b> 3 fallos seguidos leyendo la API.")
         time.sleep(1)
+
+def main():
+    log.info(f"CS2 Multi-Monitor arrancando con {len(CASES)} cajas...")
+    build_monitors()
+    threading.Thread(target=start_web, daemon=True).start()
+    threading.Thread(target=telegram_poll_loop, daemon=True).start()
+
+    # Cargar estado de cada caja (seed > state.json > backup)
+    resumed = []
+    for m in MONITORS.values():
+        seeded = m.apply_seed_if_present()
+        recovered = seeded or m.load()
+        if recovered and m.state.get('base_counter'):
+            resumed.append((m, seeded))
+
+    if resumed:
+        lines = '\n'.join(f"• {m.name}: base <code>{m.state['base_counter']:,}</code>"
+                          + (" (seed)" if seeded else "") for m, seeded in resumed)
+        send_telegram(f"♻️ <b>Multi-Monitor reanudado</b>\n{len(resumed)} de {len(CASES)} cajas "
+                      f"con estado previo:\n{lines}")
+    else:
+        send_telegram(f"⏳ <b>CS2 Multi-Monitor desplegado</b> — {len(CASES)} cajas, conectando...")
+
+    # Un hilo por caja
+    for m in MONITORS.values():
+        threading.Thread(target=case_loop, args=(m,), daemon=True).start()
+
+    # Mantener vivo el proceso principal
+    while True:
+        time.sleep(3600)
 
 if __name__ == '__main__':
     main()
