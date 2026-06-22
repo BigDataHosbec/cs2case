@@ -871,18 +871,43 @@ def do_check():
         return True
     return False
 
+def apply_seed_if_present():
+    """Si existe un seed.json (estado inicial manual), lo aplica con prioridad
+    sobre el state.json y luego lo renombra para no reaplicarlo. Esto permite
+    sembrar el estado sin pelearse con el guardado automático del monitor."""
+    seed_path = os.path.join(os.path.dirname(STATE_FILE), 'seed.json')
+    try:
+        if not os.path.exists(seed_path):
+            return False
+        with open(seed_path) as f:
+            data = json.load(f)
+        data['seen_drop_ids'] = set(data.get('seen_drop_ids', []))
+        for k in state.keys():
+            if k in data:
+                state[k] = data[k]
+        state['initialized'] = True
+        save_state()  # persistir inmediatamente como state.json oficial
+        os.replace(seed_path, seed_path + '.applied')  # marcar como aplicado
+        log.info(f"SEED aplicado — base: {state.get('base_counter')}, drops: {len(state.get('drop_history', []))}")
+        return True
+    except Exception as e:
+        log.error(f"No se pudo aplicar seed: {e}")
+        return False
+
 def main():
     log.info("CS2 Monitor (API) arrancando...")
     threading.Thread(target=start_web, daemon=True).start()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
 
-    recovered = load_state()
+    # Prioridad: si hay seed.json, lo aplica (estado inicial manual)
+    seeded = apply_seed_if_present()
+    recovered = seeded or load_state()
     if recovered and state.get('base_counter'):
         send_telegram(
             f"♻️ <b>Monitor reanudado</b>\n"
             f"Counter base: <code>{state['base_counter']:,}</code>\n"
             f"Drops en histórico: {len(state.get('drop_history', []))}\n"
-            f"<i>No se ha perdido el conteo.</i>", control_keyboard()
+            f"<i>{'Estado inicial aplicado.' if seeded else 'No se ha perdido el conteo.'}</i>", control_keyboard()
         )
     else:
         send_telegram("⏳ <b>CS2 Monitor desplegado</b> — conectando...")
