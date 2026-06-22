@@ -1,58 +1,41 @@
-# CS2 Case Monitor — versión completa
+# CS2 Case Monitor — versión multi-caja
 
 Monitor autónomo para skin.club vía API pública. Alertas Telegram + panel web
-en vivo con gráfica + control total desde panel y Telegram + estado persistente.
+con Home de selección de cajas, gráfica de 14 días + estado persistente.
 
-## Funciones
+## Novedades de esta versión
+- Panel con "Home": pantalla de selección de caja (preparada para varias cajas)
+- KPI simplificado: solo total de cajas abiertas (control)
+- Gráfica de presión combinada con ventana de 14 días
+- Horarios de drops en hora de España peninsular (Europe/Madrid, auto verano/invierno)
+- Alertas por niveles: avisa 1 vez al superar 90% y 1 vez al superar 95%
+  (se rearma cuando cae un drop y la presión baja)
+- Sin botón Reset (eliminado para evitar borrados accidentales)
 
-- Lee la API pública de skin.club (contador exacto, probabilidades, drops)
-- Presión acumulada individual por item + sequía global combinada
-- Alertas Telegram: momento caliente, sequía global, drop detectado, caja muerta
-- Panel web en vivo: KPIs, gráfica de evolución de presión, presión por item,
-  histórico de drops con estadísticas
-- Detección de "caja muerta" (contador sin subir en DEAD_AFTER_MIN minutos)
-- Botones en panel: forzar check, ir a la caja, reset (con confirmación)
-- Control desde Telegram: /menu, /estado, /check, /historico, /reset (con confirmación)
-- Persistencia: el estado sobrevive a reinicios y redeploys (Volume de Railway)
+## Cómo funciona
+Lee la API pública: https://gate.skin.club/apiv2/cases/<CASE_ID>
+Saca contador exacto, probabilidades y feed de drops. Calcula presión
+acumulada individual y combinada. Estado persistente en Volume de Railway.
 
-## Despliegue en Railway
+## Variables de entorno
 
-### 1. Sube a GitHub: Dockerfile, monitor.py, requirements.txt, railway.toml
-
-### 2. Crea un Volume en Railway → mount path: /data
-
-### 3. Variables de entorno
-
-| Variable | Valor | Descripción |
-|----------|-------|-------------|
-| TELEGRAM_TOKEN | tu token | bot de Telegram |
-| TELEGRAM_CHAT_ID | tu chat ID | tu chat |
+| Variable | Valor por defecto | Descripción |
+|----------|-------------------|-------------|
+| TELEGRAM_TOKEN | (obligatoria) | token del bot |
+| TELEGRAM_CHAT_ID | (obligatoria) | tu chat ID |
 | CASE_ID | cc-bf4940a7e | id de la caja |
+| CASE_NAME | DONT TRUST | nombre visible en la Home |
 | CHECK_INTERVAL | 60 | segundos entre checks |
-| THRESHOLD_IND | 90 | % alerta individual |
-| THRESHOLD_COMB | 90 | % alerta sequía global |
-| ALERT_COOLDOWN | 300 | seg entre alertas repetidas |
+| ALERT_LEVELS | 90,95 | niveles % de alerta |
 | DEAD_AFTER_MIN | 60 | min sin subir = caja muerta |
-| STATE_FILE | /data/state.json | archivo de estado persistente |
+| STATE_FILE | /data/state.json | estado persistente (Volume) |
 
-### 4. Settings → Networking → Generate Domain → URL del panel
+Solo TELEGRAM_TOKEN y TELEGRAM_CHAT_ID son obligatorias; el resto tiene default.
 
 ## Comandos de Telegram
+/menu · /estado · /check · /historico
 
-- /menu — abre el panel de botones
-- /estado — estado actual completo
-- /check — fuerza un check inmediato
-- /historico — últimos drops y estadísticas
-- /reset — resetea el conteo (pide confirmación)
-
-## Panel web
-
-KPIs (total cajas, desde inicio, valor esperado, retorno), gráfica de evolución
-de la presión combinada con línea del 90%, presión individual por item (rediseñada
-para legibilidad), gráfica de histórico y timeline de drops. Botones de check,
-ir a la caja y reset con confirmación.
-
-## Nota sobre el primer deploy
-
-La primera vez se pierde el conteo en memoria anterior (aún no había archivo en
-disco). A partir de ahí queda blindado: cualquier reinicio recupera el estado.
+## Añadir más cajas en el futuro
+La Home ya está preparada para listar varias cajas. Actualmente el backend
+monitoriza la caja de CASE_ID. Para multi-caja real se ampliará el backend
+para seguir varias en paralelo (estructura ya contemplada en el dashboard).

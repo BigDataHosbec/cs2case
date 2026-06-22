@@ -1,20 +1,38 @@
 import os, time, logging, json, threading
-from datetime import datetime
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+    MADRID_TZ = ZoneInfo('Europe/Madrid')
+except Exception:
+    MADRID_TZ = None
 import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 log = logging.getLogger(__name__)
 
+def to_madrid(utc_str):
+    """Convierte 'YYYY-MM-DD HH:MM:SS' (UTC) a hora de España peninsular."""
+    if not utc_str:
+        return ''
+    try:
+        dt = datetime.strptime(utc_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+        if MADRID_TZ:
+            dt = dt.astimezone(MADRID_TZ)
+        return dt.strftime('%d/%m %H:%M')
+    except Exception:
+        return utc_str
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ['TELEGRAM_TOKEN']
 TELEGRAM_CHAT_ID = str(os.environ['TELEGRAM_CHAT_ID'])
 CASE_ID          = os.environ.get('CASE_ID', 'cc-bf4940a7e')
+CASE_NAME        = os.environ.get('CASE_NAME', 'DONT TRUST')
 CASE_WEB_URL     = os.environ.get('CASE_WEB_URL', f'https://skin.club/es/cases/open/{CASE_ID}')
 API_URL          = f"https://gate.skin.club/apiv2/cases/{CASE_ID}"
 CHECK_INTERVAL   = int(os.environ.get('CHECK_INTERVAL', '60'))
-THRESHOLD_IND    = float(os.environ.get('THRESHOLD_IND', '90'))
-THRESHOLD_COMB   = float(os.environ.get('THRESHOLD_COMB', '90'))
-ALERT_COOLDOWN   = int(os.environ.get('ALERT_COOLDOWN', '300'))
+# Niveles de alerta: avisa UNA vez al cruzar cada nivel (90% y 95%).
+# No vuelve a avisar de un nivel hasta que la presión baje de 90 (cae un drop) y vuelva a cruzarlo.
+ALERT_LEVELS     = [float(x) for x in os.environ.get('ALERT_LEVELS', '90,95').split(',')]
 DEAD_AFTER_MIN   = int(os.environ.get('DEAD_AFTER_MIN', '60'))   # caja muerta si counter no sube en X min
 PORT             = int(os.environ.get('PORT', '8080'))
 STATE_FILE       = os.environ.get('STATE_FILE', '/data/state.json')
@@ -116,8 +134,8 @@ state = {
     'group_last_seen':  {},
     'last_any_rare':    None,
     'seen_drop_ids':    set(),
-    'last_alert_ind':   {},
-    'last_alert_comb':  0,
+    'alerted_levels_ind':  {},   # key -> lista de niveles ya avisados (ej: [90, 95])
+    'alerted_levels_comb': [],   # niveles ya avisados de la sequía global
     'initialized':      False,
     'group_probs':      {},
     'drop_history':     [],
@@ -128,7 +146,7 @@ state = {
 }
 
 # Flags de control desde panel/telegram
-control = {'force_check': False, 'reset_requested': False}
+control = {'force_check': False}
 
 # ── PERSISTENCIA ──────────────────────────────────────────────────────────────
 def save_state():
@@ -160,18 +178,6 @@ def load_state():
     except Exception as e:
         log.error(f"No se pudo cargar estado: {e}")
         return False
-
-def reset_state(new_counter):
-    state['base_counter']  = new_counter
-    state['last_any_rare'] = new_counter
-    for g in RARE_GROUPS:
-        state['group_last_seen'][g['key']] = new_counter
-    state['drop_history']  = []
-    state['pressure_snapshots'] = []
-    state['last_alert_ind'] = {}
-    state['last_alert_comb'] = 0
-    state['dead_alerted']  = False
-    save_state()
 
 # ── HISTÓRICO ─────────────────────────────────────────────────────────────────
 def parse_dt(s):
@@ -219,6 +225,9 @@ dashboard = {
     'status': 'arrancando', 'history_24h': [], 'history_stats': {},
     'pressure_series': [], 'kpis': {}, 'case_url': CASE_WEB_URL,
     'dead': False,
+    # Lista de cajas monitorizadas (por ahora una). La Home la usa para el menú.
+    'cases': [{'id': CASE_ID, 'name': CASE_NAME, 'url': CASE_WEB_URL}],
+    'active_case': {'id': CASE_ID, 'name': CASE_NAME, 'url': CASE_WEB_URL},
 }
 
 def initialize(data):
@@ -334,25 +343,39 @@ def process(data):
     combined_pct = combined_prob(total_p, boxes_since_any)
     expected = round(1 / total_p) if total_p > 0 else 0
 
-    # ── Snapshot de presión para la gráfica (cada check) ────────────────────
-    state['pressure_snapshots'].append({
-        't': now_dt.isoformat() + 'Z', 'counter': counter,
-        'combined_pct': round(combined_pct, 2),
-    })
-    # mantener ~24h de snapshots (a 60s = 1440 puntos); cap a 2000
-    if len(state['pressure_snapshots']) > 2000:
-        state['pressure_snapshots'] = state['pressure_snapshots'][-2000:]
+    # ── Snapshot de presión para la gráfica ─────────────────────────────────
+    # Para cubrir 14 días sin acumular demasiados puntos, guardamos como mucho
+    # un snapshot cada SNAPSHOT_EVERY_MIN minutos. 14 días a 1/30min = ~672 puntos.
+    SNAPSHOT_EVERY_MIN = 30
+    SNAPSHOT_WINDOW_DAYS = 14
+    snaps = state['pressure_snapshots']
+    now_iso = now_dt.replace(tzinfo=timezone.utc).isoformat()
+    add = True
+    if snaps:
+        try:
+            last_t = datetime.fromisoformat(snaps[-1]['t'].replace('Z', '+00:00'))
+            if (now_dt.replace(tzinfo=timezone.utc) - last_t).total_seconds() < SNAPSHOT_EVERY_MIN * 60:
+                add = False
+        except Exception:
+            add = True
+    if add:
+        snaps.append({'t': now_iso, 'counter': counter, 'combined_pct': round(combined_pct, 2)})
+        # podar a la ventana de 14 días
+        cutoff = now_dt.replace(tzinfo=timezone.utc).timestamp() - SNAPSHOT_WINDOW_DAYS * 86400
+        kept = []
+        for s in snaps:
+            try:
+                ts = datetime.fromisoformat(s['t'].replace('Z', '+00:00')).timestamp()
+                if ts >= cutoff:
+                    kept.append(s)
+            except Exception:
+                kept.append(s)
+        state['pressure_snapshots'] = kept
 
     # ── KPIs ─────────────────────────────────────────────────────────────────
     hist_stats, timeline = compute_history(now_dt)
-    case_price = data.get('case_price', 0)
-    ev = data.get('ev', 0)
     kpis = {
-        'case_price': round(case_price, 2),
-        'ev': round(ev, 4),
-        'ev_ratio': round(ev / case_price * 100, 1) if case_price else 0,
         'total_prob_pct': round(total_p * 100, 4),
-        'boxes_since_start': counter - state['base_counter'] if state['base_counter'] else 0,
     }
 
     dashboard.update({
@@ -367,7 +390,7 @@ def process(data):
                        'expected_every': round(1/i['prob']) if i['prob'] > 0 else 0} for i in hot_items],
         'history_24h': timeline,
         'history_stats': hist_stats,
-        'pressure_series': state['pressure_snapshots'][-300:],  # últimos 300 puntos a la gráfica
+        'pressure_series': state['pressure_snapshots'],  # ventana de 14 días
         'kpis': kpis,
         'status': 'activo' if not dead_now else 'caja muerta',
         'dead': dead_now,
@@ -377,30 +400,50 @@ def process(data):
     log.info(f"Counter: {counter} | Comb: {combined_pct:.1f}% ({boxes_since_any}) | {items_summary}")
 
     if state['initialized']:
-        # Alertas individuales
+        # ── Alertas individuales por niveles (90, 95) ──
+        # Avisa una sola vez al cruzar cada nivel. Se rearma cuando la presión
+        # cae por debajo del nivel más bajo (al caer un drop y resetearse).
         for item in hot_items:
-            if item['pct'] >= THRESHOLD_IND:
-                last = state['last_alert_ind'].get(item['key'], 0)
-                if now - last > ALERT_COOLDOWN:
-                    state['last_alert_ind'][item['key']] = now
+            key = item['key']
+            pct = item['pct']
+            fired = state['alerted_levels_ind'].get(key, [])
+            # rearmar: si la presión bajó del nivel más bajo, olvidar lo avisado
+            if pct < ALERT_LEVELS[0]:
+                if fired:
+                    state['alerted_levels_ind'][key] = []
+                continue
+            # avisar de cada nivel cruzado que no se haya avisado aún
+            for lvl in ALERT_LEVELS:
+                if pct >= lvl and lvl not in fired:
+                    fired.append(lvl)
+                    state['alerted_levels_ind'][key] = fired
                     send_telegram(
-                        f"🔥 <b>MOMENTO CALIENTE — {item['name']}</b>\n\n"
-                        f"Probabilidad acumulada: <b>{item['pct']:.1f}%</b>\n"
+                        f"🔥 <b>{item['name']} — supera {lvl:.0f}%</b>\n\n"
+                        f"Probabilidad acumulada: <b>{pct:.1f}%</b>\n"
                         f"Cajas sin caer: <code>{item['n']:,}</code>\n"
                         f"Counter: <code>{counter:,}</code>"
                     )
-        # Sequía global
-        if combined_pct >= THRESHOLD_COMB and now - state['last_alert_comb'] > ALERT_COOLDOWN:
-            state['last_alert_comb'] = now
-            bars = ''.join(
-                f"{'🔴' if i['pct']>=90 else '🟡' if i['pct']>=70 else '⚪'} {i['short']}: {i['pct']:.1f}%\n"
-                for i in hot_items
-            )
-            send_telegram(
-                f"⚠️ <b>SEQUÍA GLOBAL — {combined_pct:.1f}%</b>\n\n"
-                f"<code>{boxes_since_any:,}</code> cajas sin ningún raro\n"
-                f"(esperado cada ~{expected:,})\n\n{bars}"
-            )
+
+        # ── Alerta sequía global por niveles ──
+        fired_c = state['alerted_levels_comb']
+        if combined_pct < ALERT_LEVELS[0]:
+            if fired_c:
+                state['alerted_levels_comb'] = []
+        else:
+            for lvl in ALERT_LEVELS:
+                if combined_pct >= lvl and lvl not in fired_c:
+                    fired_c.append(lvl)
+                    state['alerted_levels_comb'] = fired_c
+                    bars = ''.join(
+                        f"{'🔴' if i['pct']>=90 else '🟡' if i['pct']>=70 else '⚪'} {i['short']}: {i['pct']:.1f}%\n"
+                        for i in hot_items
+                    )
+                    send_telegram(
+                        f"⚠️ <b>SEQUÍA GLOBAL — supera {lvl:.0f}%</b>\n\n"
+                        f"Presión combinada: <b>{combined_pct:.1f}%</b>\n"
+                        f"<code>{boxes_since_any:,}</code> cajas sin ningún raro\n"
+                        f"(esperado cada ~{expected:,})\n\n{bars}"
+                    )
         # Drops nuevos
         for d in new_rares:
             pi = d.get('pressure_individual')
@@ -442,7 +485,6 @@ def control_keyboard():
          {'text': '🔄 Check ahora', 'callback_data': 'check'}],
         [{'text': '📜 Histórico', 'callback_data': 'history'},
          {'text': '🌐 Ir a la caja', 'url': CASE_WEB_URL}],
-        [{'text': '♻️ Reset (confirmar)', 'callback_data': 'reset_confirm'}],
     ]}
 
 def telegram_history_text():
@@ -455,7 +497,7 @@ def telegram_history_text():
              f"Total registrados: {hs.get('total_tracked',0)} · 24h: {hs.get('count_24h',0)}",
              f"Intervalo medio: {hs.get('avg_gap_h','?')}h · último hace {hs.get('hours_since_last','?')}h", ""]
     for x in tl:
-        lines.append(f"• {x['created_at']} — {x['name']} ({x['price']})")
+        lines.append(f"• {to_madrid(x['created_at'])} — {x['name']} ({x['price']})")
     return '\n'.join(lines)
 
 def answer_callback(cb_id, text=None):
@@ -478,11 +520,6 @@ def handle_command(text, chat_id):
         send_telegram("🔄 Check forzado en marcha...")
     elif cmd in ('history', 'historico', 'histórico'):
         send_telegram(telegram_history_text())
-    elif cmd == 'reset':
-        send_telegram("⚠️ ¿Seguro que quieres resetear el conteo? Esto borra el histórico acumulado.",
-                      {'inline_keyboard': [[
-                          {'text': '✅ Sí, resetear', 'callback_data': 'reset_yes'},
-                          {'text': '❌ Cancelar', 'callback_data': 'reset_no'}]]})
     else:
         send_telegram("No reconozco ese comando. Pulsa /menu para ver las opciones.")
 
@@ -500,19 +537,6 @@ def handle_callback(data, cb_id, chat_id):
     elif data == 'history':
         answer_callback(cb_id)
         send_telegram(telegram_history_text())
-    elif data == 'reset_confirm':
-        answer_callback(cb_id)
-        send_telegram("⚠️ ¿Seguro que quieres resetear el conteo? Borra el histórico acumulado.",
-                      {'inline_keyboard': [[
-                          {'text': '✅ Sí, resetear', 'callback_data': 'reset_yes'},
-                          {'text': '❌ Cancelar', 'callback_data': 'reset_no'}]]})
-    elif data == 'reset_yes':
-        control['reset_requested'] = True
-        answer_callback(cb_id, "Reseteando...")
-        send_telegram("♻️ Reset solicitado. Se aplicará en el próximo check.")
-    elif data == 'reset_no':
-        answer_callback(cb_id, "Cancelado")
-        send_telegram("❌ Reset cancelado.")
 
 def telegram_poll_loop():
     offset = None
@@ -576,6 +600,7 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 
 /* KPI strip */
 .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
+.kpis-1{grid-template-columns:1fr}
 .kpi{background:var(--bg2);border:1px solid var(--bd);border-radius:6px;padding:9px 6px;text-align:center}
 .kpi-v{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy)}
 .kpi-v.neg{color:var(--red)}.kpi-v.pos{color:var(--grn)}
@@ -603,6 +628,20 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
 .covert{background:#eb4b4b}.classified{background:#8847ff}.milspec{background:#5e98d9}.consumer{background:#b0b0b0}
+
+/* home / selector de cajas */
+.home-title{font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--mut2);letter-spacing:2px;text-transform:uppercase;margin:8px 0 14px}
+.case-card{background:linear-gradient(135deg,var(--bg2),var(--bg3));border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:10px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.case-card:hover{border-color:var(--cy);transform:translateY(-1px)}
+.case-card:active{transform:translateY(0)}
+.case-info{flex:1;min-width:0}
+.case-name{font-size:16px;font-weight:700;color:var(--tx);margin-bottom:4px}
+.case-meta{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--mut2)}
+.case-pct{font-family:'Share Tech Mono',monospace;font-size:22px;font-weight:700;flex-shrink:0}
+.case-arrow{color:var(--cy);font-size:18px;flex-shrink:0}
+.back-btn{display:inline-flex;align-items:center;gap:6px;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--mut2);cursor:pointer;margin-bottom:12px;padding:6px 0;background:none;border:none;letter-spacing:1px}
+.back-btn:hover{color:var(--cy)}
+.hidden{display:none!important}
 
 /* chart */
 .chart-wrap{background:var(--bg2);border:1px solid var(--bd);border-radius:6px;padding:12px}
@@ -636,26 +675,26 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 .drop-p{font-family:'Share Tech Mono',monospace;font-size:13px;color:var(--gold);flex-shrink:0;align-self:flex-start}
 
 /* actions */
-.actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:16px 0}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}
 .btn{padding:11px 8px;border-radius:6px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;text-transform:uppercase;border:1px solid;background:transparent;transition:all .2s;text-align:center;text-decoration:none;display:flex;align-items:center;justify-content:center;gap:5px}
 .btn-check{border-color:var(--cy);color:var(--cy)}.btn-check:active{background:rgba(74,243,255,.15)}
 .btn-web{border-color:var(--gold);color:var(--gold)}.btn-web:active{background:rgba(240,165,0,.15)}
-.btn-reset{border-color:var(--red);color:var(--red)}.btn-reset:active{background:rgba(255,59,92,.15)}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--bg3);border:1px solid var(--cy);color:var(--cy);font-family:'Share Tech Mono',monospace;font-size:12px;padding:10px 18px;border-radius:6px;transition:transform .3s;z-index:1000}
 .toast.show{transform:translateX(-50%) translateY(0)}
-/* modal */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:1001;padding:20px}
-.modal.show{display:flex}
-.modal-box{background:var(--bg2);border:1px solid var(--red);border-radius:8px;padding:20px;max-width:340px;text-align:center}
-.modal-box h3{font-family:'Share Tech Mono',monospace;font-size:13px;color:var(--red);letter-spacing:1px;margin-bottom:10px}
-.modal-box p{font-size:13px;color:var(--tx);margin-bottom:16px;line-height:1.4}
-.modal-btns{display:flex;gap:10px}
-.modal-btns .btn{flex:1}
-.btn-cancel{border-color:var(--mut2);color:var(--mut2)}
 .dead-banner{display:none;background:rgba(255,59,92,.12);border:1px solid var(--red);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:'Share Tech Mono',monospace;font-size:12px;color:var(--red);letter-spacing:1px}
 .dead-banner.show{display:block}
 </style></head><body>
-<div class="hdr"><h1>CS2 CASE MONITOR</h1><div class="live" id="live"><span class="d"></span><span id="liveTxt">EN VIVO</span></div></div>
+<div class="hdr"><h1 id="mainTitle">CS2 CASE MONITOR</h1><div class="live" id="live"><span class="d"></span><span id="liveTxt">EN VIVO</span></div></div>
+
+<!-- ── HOME: selección de caja ── -->
+<div id="homeView">
+  <div class="home-title">// Selecciona una caja para monitorizar</div>
+  <div id="caseList"></div>
+</div>
+
+<!-- ── DETALLE de una caja ── -->
+<div id="detailView" class="hidden">
+<button class="back-btn" id="backBtn">◄ Volver a la lista de cajas</button>
 <div class="sub" id="sub">cargando...</div>
 
 <div class="dead-banner" id="deadBanner">💀 CAJA MUERTA — el contador no sube. Posible retirada de la caja.</div>
@@ -666,23 +705,19 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
   <div class="cmb-foot"><span class="cmb-boxes"><b id="cBoxes">—</b> cajas sin caer ningún raro</span><span class="cmb-exp" id="cExp"></span></div>
 </div>
 
-<div class="kpis">
-  <div class="kpi"><div class="kpi-v" id="kCounter">—</div><div class="kpi-l">Total cajas</div></div>
-  <div class="kpi"><div class="kpi-v" id="kStart">—</div><div class="kpi-l">Desde inicio</div></div>
-  <div class="kpi"><div class="kpi-v" id="kEv">—</div><div class="kpi-l">Valor esper.</div></div>
-  <div class="kpi"><div class="kpi-v" id="kRoi">—</div><div class="kpi-l">Retorno</div></div>
+<div class="kpis kpis-1">
+  <div class="kpi"><div class="kpi-v" id="kCounter">—</div><div class="kpi-l">Total cajas abiertas (control)</div></div>
 </div>
 
-<div class="actions">
+<div class="actions actions-2">
   <button class="btn btn-check" id="btnCheck">🔄 Check ya</button>
-  <a class="btn btn-web" id="btnWeb" href="#" target="_blank">🌐 Ir a caja</a>
-  <button class="btn btn-reset" id="btnReset">♻️ Reset</button>
+  <a class="btn btn-web" id="btnWeb" href="#" target="_blank">🌐 Ir a la caja</a>
 </div>
 
 <div class="sec">Presión individual por item</div>
 <div id="items"></div>
 
-<div class="sec">Evolución de la presión combinada</div>
+<div class="sec">Evolución de la presión combinada · 14 días</div>
 <div class="chart-wrap"><canvas id="chart"></canvas><div class="chart-legend"><span id="chartFrom">—</span><span>presión combinada %</span><span id="chartTo">ahora</span></div></div>
 
 <div class="sec">Histórico de drops raros</div>
@@ -694,16 +729,9 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 <div class="chips" id="chips"></div>
 <button class="tl-toggle" id="tlToggle">📜 Ver histórico de drops <span class="arrow">▼</span></button>
 <div class="tl-wrap" id="tlWrap"><div class="tl" id="timeline"></div></div>
+</div><!-- /detailView -->
 
 <div class="toast" id="toast"></div>
-<div class="modal" id="modal"><div class="modal-box">
-  <h3>⚠️ Confirmar reset</h3>
-  <p>Esto borra el conteo y el histórico acumulado, empezando de cero desde el contador actual. No se puede deshacer.</p>
-  <div class="modal-btns">
-    <button class="btn btn-cancel" id="mCancel">Cancelar</button>
-    <button class="btn btn-reset" id="mConfirm">Sí, resetear</button>
-  </div>
-</div></div>
 
 <script>
 const RAR={butterfly:'covert',spec_gloves:'covert',awp:'covert',sport_gloves:'covert',ak47:'classified'};
@@ -711,7 +739,54 @@ const NAMES={butterfly:'Butterfly',spec_gloves:'Spec Gloves',awp:'AWP QG',sport_
 function zone(p){return p>=90?'hot':p>=70?'warm':''}
 function fmtDrop(n){const p=n.split('|');return p.length>1?`${p[0].trim()} ${p[1].trim()}`:n}
 function nf(n){return (n||0).toLocaleString('es-ES')}
+function fmtTime(utcStr){
+  // La API da "2026-06-22 04:04:01" en UTC. Convertir a hora de España peninsular.
+  if(!utcStr) return '';
+  const iso=utcStr.replace(' ','T')+'Z';
+  const d=new Date(iso);
+  if(isNaN(d)) return utcStr;
+  return d.toLocaleString('es-ES',{timeZone:'Europe/Madrid',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
+
+// ── Navegación Home / Detalle ──
+let currentView='home';   // 'home' | 'detail'
+let selectedCaseId=null;
+function showHome(){
+  currentView='home';selectedCaseId=null;
+  document.getElementById('homeView').classList.remove('hidden');
+  document.getElementById('detailView').classList.add('hidden');
+  document.getElementById('mainTitle').textContent='CS2 CASE MONITOR';
+  document.getElementById('live').style.visibility='hidden';
+}
+function showDetail(caseId){
+  currentView='detail';selectedCaseId=caseId;
+  document.getElementById('homeView').classList.add('hidden');
+  document.getElementById('detailView').classList.remove('hidden');
+  document.getElementById('live').style.visibility='visible';
+  load();
+}
+function renderHome(d){
+  const cases=d.cases||[];
+  const cur=(selectedCaseId)||null;
+  // por ahora la métrica de cada caja viene del dashboard activo
+  document.getElementById('caseList').innerHTML=cases.map(c=>{
+    const isActive=d.active_case&&d.active_case.id===c.id;
+    const pct=isActive?(d.combined_pct||0):null;
+    const z=pct!=null?zone(pct):'';
+    const col=z==='hot'?'var(--red)':z==='warm'?'var(--or)':'var(--cy)';
+    const pctTxt=pct!=null?pct.toFixed(1)+'%':'—';
+    const meta=isActive?(nf(d.boxes_since_any||0)+' cajas sin raro · '+(d.counter?nf(d.counter):'—')+' abiertas'):'monitor activo';
+    return `<div class="case-card" data-case="${c.id}">
+      <div class="case-info"><div class="case-name">${c.name}</div><div class="case-meta">${meta}</div></div>
+      <div class="case-pct" style="color:${col}">${pctTxt}</div>
+      <div class="case-arrow">►</div>
+    </div>`;
+  }).join('');
+  document.querySelectorAll('.case-card').forEach(el=>{
+    el.addEventListener('click',()=>showDetail(el.dataset.case));
+  });
+}
 
 function drawChart(series){
   const cv=document.getElementById('chart');const dpr=window.devicePixelRatio||1;
@@ -742,6 +817,11 @@ function drawChart(series){
 async function load(){
   try{
     const d=await(await fetch('/data')).json();
+    // La Home siempre se mantiene actualizada
+    renderHome(d);
+    // Si estamos en la Home, no hace falta pintar el detalle
+    if(currentView!=='detail'){return;}
+    document.getElementById('mainTitle').textContent=(d.active_case&&d.active_case.name)?d.active_case.name.toUpperCase():'CS2 CASE MONITOR';
     const cls=zone(d.combined_pct);
     document.getElementById('cCard').className='combined '+cls;
     document.getElementById('cPct').className='cmb-big '+cls;
@@ -753,11 +833,8 @@ async function load(){
     document.getElementById('cExp').title='Sale de sumar las probabilidades de todos los raros ('+(d.kpis&&d.kpis.total_prob_pct||'')+'%) e invertir. Es fijo salvo que la caja cambie.';
     // KPIs
     const k=d.kpis||{};
+    const hsk=d.history_stats||{};
     document.getElementById('kCounter').textContent=d.counter?nf(d.counter):'—';
-    document.getElementById('kStart').textContent='+'+nf(k.boxes_since_start);
-    document.getElementById('kEv').textContent=k.ev!=null?'$'+k.ev.toFixed(2):'—';
-    const roiEl=document.getElementById('kRoi');roiEl.textContent=k.ev_ratio!=null?k.ev_ratio+'%':'—';
-    roiEl.className='kpi-v '+(k.ev_ratio>=100?'pos':'neg');
     // status
     document.getElementById('btnWeb').href=d.case_url||'#';
     const upd=d.updated?new Date(d.updated):null;
@@ -784,7 +861,7 @@ async function load(){
     // chart
     drawChart(d.pressure_series||[]);
     const ps=d.pressure_series||[];
-    if(ps.length){document.getElementById('chartFrom').textContent=new Date(ps[0].t).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})}
+    if(ps.length){document.getElementById('chartFrom').textContent=fmtTime((ps[0].t||'').replace('T',' ').replace(/(\+.*|Z)$/,''))}
     // history
     const hs=d.history_stats||{};
     document.getElementById('h24').textContent=hs.count_24h!=null?hs.count_24h:'—';
@@ -806,7 +883,7 @@ async function load(){
       } else {
         press=`<div class="drop-press"><span class="pbadge">sin datos de presión</span></div>`;
       }
-      return `<div class="drop"><span class="dot ${RAR[x.key]||'milspec'}" style="margin-top:3px"></span><div class="drop-i"><div class="drop-n">${fmtDrop(x.name)}</div><div class="drop-t">${x.created_at||''} UTC</div>${press}</div><div class="drop-p">${x.price}</div></div>`;
+      return `<div class="drop"><span class="dot ${RAR[x.key]||'milspec'}" style="margin-top:3px"></span><div class="drop-i"><div class="drop-n">${fmtDrop(x.name)}</div><div class="drop-t">${fmtTime(x.created_at)}</div>${press}</div><div class="drop-p">${x.price}</div></div>`;
     }).join('')||'<div style="padding:12px;font-size:11px;color:var(--mut2);font-family:monospace">acumulando histórico...</div>';
   }catch(e){document.getElementById('sub').textContent='error cargando'}
 }
@@ -815,19 +892,15 @@ document.getElementById('btnCheck').addEventListener('click',async()=>{
   toast('Forzando check...');try{await fetch('/action/check',{method:'POST'})}catch(e){}
   setTimeout(load,3000);
 });
-document.getElementById('btnReset').addEventListener('click',()=>document.getElementById('modal').classList.add('show'));
-document.getElementById('mCancel').addEventListener('click',()=>document.getElementById('modal').classList.remove('show'));
-document.getElementById('mConfirm').addEventListener('click',async()=>{
-  document.getElementById('modal').classList.remove('show');toast('Reseteando...');
-  try{await fetch('/action/reset',{method:'POST'})}catch(e){}setTimeout(load,2000);
-});
 document.getElementById('tlToggle').addEventListener('click',()=>{
   const w=document.getElementById('tlWrap');const b=document.getElementById('tlToggle');
   const open=w.classList.toggle('open');b.classList.toggle('open',open);
   b.firstChild.textContent=open?'📜 Ocultar histórico ':'📜 Ver histórico de drops ';
 });
+document.getElementById('backBtn').addEventListener('click',showHome);
+showHome();           // arrancar en la Home
 load();setInterval(load,5000);
-window.addEventListener('resize',load);
+window.addEventListener('resize',()=>{if(currentView==='detail')load();});
 </script></body></html>
 """
 
@@ -841,9 +914,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/action/check':
             control['force_check'] = True
-            self._json({'ok': True})
-        elif self.path == '/action/reset':
-            control['reset_requested'] = True
             self._json({'ok': True})
         else:
             self._json({'ok': False}, 404)
@@ -863,10 +933,6 @@ def start_web():
 def do_check():
     data = fetch_data()
     if data and data.get('counter'):
-        if control['reset_requested']:
-            control['reset_requested'] = False
-            reset_state(data['counter'])
-            send_telegram(f"♻️ <b>Conteo reseteado</b>\nNueva base: <code>{data['counter']:,}</code>")
         process(data)
         return True
     return False
