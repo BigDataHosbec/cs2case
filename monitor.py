@@ -1,5 +1,6 @@
-import os, time, logging, json, threading
+import os, time, logging, json, threading, math
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 try:
     from zoneinfo import ZoneInfo
     MADRID_TZ = ZoneInfo('Europe/Madrid')
@@ -7,7 +8,17 @@ except Exception:
     MADRID_TZ = None
 import requests
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+_handlers = [logging.StreamHandler()]
+# Log rotativo en el Volume para poder investigar incidencias a posteriori
+try:
+    _log_dir = os.environ.get('DATA_DIR', '/data')
+    os.makedirs(_log_dir, exist_ok=True)
+    _fh = RotatingFileHandler(os.path.join(_log_dir, 'monitor.log'),
+                              maxBytes=2_000_000, backupCount=3)
+    _handlers.append(_fh)
+except Exception:
+    pass  # si no se puede escribir el log, seguimos solo con stdout
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', handlers=_handlers)
 log = logging.getLogger(__name__)
 
 def to_madrid(utc_str):
@@ -32,6 +43,8 @@ PORT             = int(os.environ.get('PORT', '8080'))
 DATA_DIR         = os.environ.get('DATA_DIR', '/data')
 # Umbral de rareza: items con chance <= este % se consideran "raros" y se siguen.
 RARE_MAX_CHANCE  = float(os.environ.get('RARE_MAX_CHANCE', '0.01'))
+# Factor de racha anómala: avisa si la sequía supera N veces lo esperado.
+ANOMALY_FACTOR   = float(os.environ.get('ANOMALY_FACTOR', '3'))
 
 # ── DEFINICIÓN DE CAJAS ───────────────────────────────────────────────────────
 # Cada caja: id, nombre visible, y archivo de estado.
@@ -39,7 +52,9 @@ RARE_MAX_CHANCE  = float(os.environ.get('RARE_MAX_CHANCE', '0.01'))
 CASES = [
     {'id': 'cc-bf4940a7e', 'name': 'DONT TRUST',          'state_file': os.path.join(DATA_DIR, 'state.json')},
     {'id': 'cc-08e7b18f7', 'name': '1º NO PAIN 85%',       'state_file': os.path.join(DATA_DIR, 'state_cc-08e7b18f7.json')},
-    {'id': 'cc-c81e43fb8', 'name': 'NO PAIN 84% PROFIT',   'state_file': os.path.join(DATA_DIR, 'state_cc-c81e43fb8.json')},
+    # En esta caja seguimos SOLO la M4A4 Hellfire (no el resto de raros).
+    {'id': 'cc-c81e43fb8', 'name': 'NO PAIN 84% PROFIT',   'state_file': os.path.join(DATA_DIR, 'state_cc-c81e43fb8.json'),
+     'only_items': ['m4a4 | hellfire']},
 ]
 # Permite override por env (JSON) para añadir/quitar cajas sin tocar código.
 _cases_env = os.environ.get('CASES_JSON')
@@ -90,12 +105,15 @@ HEADERS = {
 
 # ── MONITOR DE UNA CAJA ───────────────────────────────────────────────────────
 class CaseMonitor:
-    def __init__(self, case_id, name, state_file):
+    def __init__(self, case_id, name, state_file, only_items=None):
         self.case_id = case_id
         self.name = name
         self.state_file = state_file
         self.api = api_url(case_id)
         self.web = case_web_url(case_id)
+        # Si se define, SOLO se siguen los items cuyo nombre contenga uno de estos
+        # fragmentos (en minúsculas). Ignora el umbral de probabilidad.
+        self.only_items = [s.lower() for s in only_items] if only_items else None
         self.lock = threading.Lock()
         self.state = {
             'base_counter': None, 'group_last_seen': {}, 'last_any_rare': None,
@@ -103,13 +121,25 @@ class CaseMonitor:
             'initialized': False, 'group_probs': {}, 'rare_meta': {}, 'drop_history': [],
             'pressure_snapshots': [], 'last_counter': None,
             'last_counter_change_ts': None, 'dead_alerted': False, 'api_warned': False,
+            # ── Análisis de tasa observada vs declarada ──
+            'observed_start_counter': None,   # counter cuando empezó la observación fiable
+            'observed_drops': {},             # key -> nº de drops observados (detectados en vivo)
+            'observed_value': 0.0,            # valor $ total de los drops raros observados
+            'intervals': [],                  # cajas entre drops raros consecutivos (cualquiera)
+            'last_rare_counter': None,        # counter del último raro (para medir intervalos)
+            'missed_gaps': 0,                 # nº de veces que un reinicio pudo perder drops
+            'rate_limited_until': None,       # epoch hasta el que estamos rate-limited
+            'rate_warned': False,
+            'last_ok_check_ts': None,         # último check exitoso (para health)
+            'total_checks': 0, 'total_fails': 0,
+            'anomaly_alerted': False,         # si ya avisamos de racha anómala
         }
         self.dashboard = {
             'id': case_id, 'name': name, 'counter': None, 'updated': None,
             'combined_pct': 0, 'boxes_since_any': 0, 'hot_items': [], 'expected_every': 0,
             'check_interval': CHECK_INTERVAL, 'status': 'arrancando', 'history_24h': [],
             'history_stats': {}, 'pressure_series': [], 'kpis': {}, 'case_url': self.web,
-            'dead': False,
+            'dead': False, 'analysis': {},
         }
         self.control = {'force_check': False}
 
@@ -231,6 +261,16 @@ class CaseMonitor:
                     if k in data:
                         self.state[k] = data[k]
                 self._migrate_legacy_keys()
+                # Si el estado viejo no tenía campos de análisis, inicializarlos ahora
+                # (la observación fiable empieza desde este momento)
+                if self.state.get('observed_start_counter') is None and self.state.get('last_counter'):
+                    self.state['observed_start_counter'] = self.state['last_counter']
+                    self.state['last_rare_counter'] = self.state.get('last_any_rare') or self.state['last_counter']
+                    if not self.state.get('observed_drops'):
+                        self.state['observed_drops'] = {}
+                    self.state.setdefault('observed_value', 0.0)
+                    self.state.setdefault('intervals', [])
+                    log.info(f"[{self.case_id}] análisis inicializado desde estado existente")
                 log.info(f"[{self.case_id}] estado recuperado ({label}) — base: {self.state.get('base_counter')}")
                 if label == 'backup':
                     send_telegram(f"⚠️ <b>{self.name}: estado principal corrupto</b> — recuperado desde backup.")
@@ -278,10 +318,28 @@ class CaseMonitor:
     def fetch(self):
         try:
             r = requests.get(self.api, headers=HEADERS, timeout=20)
+            # Manejo de rate-limiting: si la API nos limita (429), respetamos el backoff
+            if r.status_code == 429:
+                retry_after = r.headers.get('Retry-After')
+                wait = int(retry_after) if (retry_after and retry_after.isdigit()) else 120
+                self.state['rate_limited_until'] = time.time() + wait
+                log.error(f"[{self.case_id}] rate-limited (429), esperando {wait}s")
+                if not self.state.get('rate_warned'):
+                    self.state['rate_warned'] = True
+                    send_telegram(f"⏳ <b>{self.name}: la API limitó peticiones (429)</b>\n"
+                                  f"Espaciando checks {wait}s automáticamente.")
+                return None
             r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            log.error(f"[{self.case_id}] fetch HTTP error: {e}")
+            return None
         except Exception as e:
             log.error(f"[{self.case_id}] fetch error (red): {e}")
             return None
+        # si veníamos rate-limited y ahora funciona, limpiar aviso
+        if self.state.get('rate_warned'):
+            self.state['rate_warned'] = False
+            self.state['rate_limited_until'] = None
         try:
             payload = r.json()
         except Exception as e:
@@ -299,7 +357,7 @@ class CaseMonitor:
 
         try:
             contents = (d.get('last_successful_generation') or {}).get('contents', [])
-            # Detectar raros automáticamente: chance <= RARE_MAX_CHANCE
+            # Detectar raros. Si hay only_items, solo esos; si no, por umbral de prob.
             rare_meta = {}   # base_name -> {name, short, prob}
             for c in contents:
                 try:
@@ -307,7 +365,11 @@ class CaseMonitor:
                     chance = float(c['chance_percent'])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if chance <= RARE_MAX_CHANCE:
+                if self.only_items is not None:
+                    is_rare = any(frag in nm.lower() for frag in self.only_items)
+                else:
+                    is_rare = chance <= RARE_MAX_CHANCE
+                if is_rare:
                     base = self._base_name(nm)
                     p = chance / 100.0
                     if base in rare_meta:
@@ -358,6 +420,12 @@ class CaseMonitor:
         self.state['last_counter'] = counter
         self.state['last_counter_change_ts'] = time.time()
         self.state['initialized'] = True
+        # Inicio de la observación fiable (denominador para tasa observada vs declarada)
+        self.state['observed_start_counter'] = counter
+        self.state['observed_drops'] = {key: 0 for key in data['rare_meta']}
+        self.state['observed_value'] = 0.0
+        self.state['intervals'] = []
+        self.state['last_rare_counter'] = counter
         seed = [d for d in data['drops'] if d['key'] is not None]
         seed.sort(key=lambda x: x.get('created_at', ''))
         self.state['drop_history'] = seed
@@ -465,8 +533,20 @@ class CaseMonitor:
             d['boxes_combined'] = n_any
 
         for d in new_rares:
-            st['group_last_seen'][d['key']] = counter
+            key = d['key']
+            st['group_last_seen'][key] = counter
             st['drop_history'].append(d)
+            # ── Registro para análisis de tasa observada ──
+            st['observed_drops'][key] = st['observed_drops'].get(key, 0) + 1
+            st['observed_value'] = st.get('observed_value', 0.0) + d.get('price', 0.0)
+            # intervalo en cajas desde el último raro (cualquiera)
+            if st.get('last_rare_counter') is not None:
+                gap = counter - st['last_rare_counter']
+                if gap > 0:
+                    st.setdefault('intervals', []).append(gap)
+                    if len(st['intervals']) > 500:
+                        st['intervals'] = st['intervals'][-500:]
+            st['last_rare_counter'] = counter
         if new_rares:
             st['last_any_rare'] = counter
         st['drop_history'].sort(key=lambda x: x.get('created_at', ''))
@@ -513,6 +593,7 @@ class CaseMonitor:
             st['pressure_snapshots'] = kept[-1500:]
 
         hist_stats, timeline = self.compute_history(now_dt)
+        analysis = self.compute_analysis(counter, hot_items, total_p, expected, boxes_since_any)
         self.dashboard.update({
             'counter': counter, 'updated': now_dt.isoformat() + 'Z',
             'combined_pct': round(combined_pct, 2), 'boxes_since_any': boxes_since_any,
@@ -524,12 +605,111 @@ class CaseMonitor:
             'history_24h': timeline, 'history_stats': hist_stats,
             'pressure_series': st['pressure_snapshots'],
             'kpis': {'total_prob_pct': round(total_p*100, 4)},
+            'analysis': analysis,
             'status': 'activo' if not dead_now else 'caja muerta', 'dead': dead_now,
         })
 
         if st['initialized']:
             self._alerts(hot_items, combined_pct, boxes_since_any, expected, counter, new_rares)
         self.save()
+
+    def compute_analysis(self, counter, hot_items, total_p, expected, boxes_since_any=0):
+        """Tasa observada vs declarada, honestidad, valor real, intervalos, anomalía.
+        Solo es fiable cuando se han observado suficientes cajas/drops."""
+        st = self.state
+        start = st.get('observed_start_counter')
+        if start is None:
+            return {}
+        boxes_observed = max(0, counter - start)
+        obs_drops = st.get('observed_drops', {})
+        total_obs = sum(obs_drops.values())
+
+        # Factor de anomalía: cuántas veces el nº esperado de cajas lleva la sequía actual.
+        # 1.0 = justo lo esperado · 2.0 = el doble de seco · 3+ = racha muy anómala.
+        anomaly = round(boxes_since_any / expected, 2) if expected > 0 else None
+
+        # Tasa combinada observada vs declarada
+        declared_rate = total_p  # prob por caja de cualquier raro
+        observed_rate = (total_obs / boxes_observed) if boxes_observed > 0 else 0
+        # Ratio honestidad: observado/declarado (1.0 = exacto, <1 paga menos, >1 más)
+        honesty = (observed_rate / declared_rate) if declared_rate > 0 else None
+
+        # Fiabilidad estadística: cuántos drops esperaríamos con las cajas observadas
+        expected_drops = boxes_observed * declared_rate
+        # margen de error aproximado (Poisson): ±1.96·sqrt(esperados)/esperados
+        if expected_drops >= 1:
+            rel_margin = 1.96 * math.sqrt(expected_drops) / expected_drops
+        else:
+            rel_margin = None
+
+        # Por item: observado vs esperado
+        per_item = []
+        for it in hot_items:
+            key = it['key']
+            od = obs_drops.get(key, 0)
+            exp_d = boxes_observed * it['prob']
+            per_item.append({
+                'key': key, 'short': it['short'],
+                'observed': od,
+                'expected': round(exp_d, 2),
+                'declared_prob': round(it['prob']*100, 4),
+                'observed_prob': round(od / boxes_observed * 100, 4) if boxes_observed > 0 else None,
+            })
+
+        # Distribución de intervalos
+        intervals = st.get('intervals', [])
+        interval_stats = None
+        if intervals:
+            srt = sorted(intervals)
+            n = len(srt)
+            median = srt[n//2]
+            interval_stats = {
+                'count': n, 'min': min(srt), 'max': max(srt),
+                'mean': round(sum(srt)/n), 'median': median,
+                'declared_mean': expected,  # lo que debería ser de media
+            }
+
+        # Confianza estadística: depende de cuántos drops se han OBSERVADO de verdad
+        # (con pocos drops reales no se puede concluir nada, aunque se esperaran muchos).
+        # Usamos el menor de observados y esperados como tamaño de muestra efectivo.
+        sample = min(total_obs, expected_drops)
+        if sample < 5:
+            confidence = 'baja'      # insuficiente para juzgar honestidad
+        elif sample < 20:
+            confidence = 'media'
+        else:
+            confidence = 'alta'
+
+        # Margen de error real basado en lo OBSERVADO (Poisson sobre el conteo real)
+        if total_obs >= 1:
+            obs_margin = 1.96 * math.sqrt(total_obs) / total_obs
+        else:
+            obs_margin = None
+
+        # Veredicto de honestidad solo si hay confianza suficiente
+        verdict = None
+        if confidence != 'baja' and honesty is not None:
+            if honesty >= 0.85:
+                verdict = 'justa'
+            elif honesty >= 0.6:
+                verdict = 'algo por debajo'
+            else:
+                verdict = 'paga menos de lo declarado'
+
+        return {
+            'boxes_observed': boxes_observed,
+            'total_observed': total_obs,
+            'expected_drops': round(expected_drops, 1),
+            'observed_value': round(st.get('observed_value', 0.0), 2),
+            'honesty_ratio': round(honesty, 2) if honesty is not None else None,
+            'rel_margin_pct': round(obs_margin*100, 1) if obs_margin is not None else None,
+            'confidence': confidence,
+            'verdict': verdict,
+            'anomaly': anomaly,
+            'per_item': per_item,
+            'intervals': interval_stats,
+        }
+
 
     def _alerts(self, hot_items, combined_pct, boxes_since_any, expected, counter, new_rares):
         st = self.state
@@ -569,13 +749,50 @@ class CaseMonitor:
                           f"Precio: ${d['price']:.2f} · Counter: <code>{counter:,}</code>\n"
                           f"{press}<i>Contador de {self.group_name(d['key'])} reseteado</i>")
 
+        # Alerta de racha anómala: sequía supera ANOMALY_FACTOR veces lo esperado.
+        # Es la señal más interesante de observar (la caja lleva "demasiado" sin pagar).
+        if expected > 0:
+            anomaly = boxes_since_any / expected
+            if anomaly >= ANOMALY_FACTOR and not st.get('anomaly_alerted'):
+                st['anomaly_alerted'] = True
+                send_telegram(f"📈 <b>{self.name}: RACHA ANÓMALA</b>\n\n"
+                              f"Lleva <b>{anomaly:.1f}×</b> lo esperado sin ningún raro.\n"
+                              f"<code>{boxes_since_any:,}</code> cajas (esperado cada ~{expected:,}).\n"
+                              f"<i>Estadísticamente inusual, aunque cada caja sigue siendo independiente.</i>")
+            elif anomaly < ANOMALY_FACTOR and st.get('anomaly_alerted'):
+                st['anomaly_alerted'] = False  # rearmar cuando vuelve a la normalidad
+
     def do_check(self):
+        self.state['total_checks'] = self.state.get('total_checks', 0) + 1
         data = self.fetch()
         if data and data.get('counter'):
             with self.lock:
                 self.process(data)
+            self.state['last_ok_check_ts'] = time.time()
             return True
+        self.state['total_fails'] = self.state.get('total_fails', 0) + 1
         return False
+
+    def is_rate_limited(self):
+        until = self.state.get('rate_limited_until')
+        return until is not None and time.time() < until
+
+    def health(self):
+        """Estado de salud de esta caja para el endpoint /health."""
+        last_ok = self.state.get('last_ok_check_ts')
+        age = (time.time() - last_ok) if last_ok else None
+        # sano si tuvo un check OK en los últimos 5 intervalos
+        healthy = age is not None and age < CHECK_INTERVAL * 5
+        return {
+            'id': self.case_id, 'name': self.name,
+            'healthy': healthy,
+            'seconds_since_ok': round(age) if age is not None else None,
+            'total_checks': self.state.get('total_checks', 0),
+            'total_fails': self.state.get('total_fails', 0),
+            'rate_limited': self.is_rate_limited(),
+            'initialized': self.state.get('initialized', False),
+            'counter': self.dashboard.get('counter'),
+        }
 
 # ── HELPERS GLOBALES ──────────────────────────────────────────────────────────
 def parse_dt(s):
@@ -588,7 +805,8 @@ def parse_dt(s):
 MONITORS = {}   # case_id -> CaseMonitor
 def build_monitors():
     for c in CASES:
-        MONITORS[c['id']] = CaseMonitor(c['id'], c['name'], c['state_file'])
+        MONITORS[c['id']] = CaseMonitor(c['id'], c['name'], c['state_file'],
+                                        only_items=c.get('only_items'))
 
 def get_monitor(case_id):
     return MONITORS.get(case_id)
@@ -739,6 +957,11 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 .fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#1e4060,var(--cy));transition:width .8s cubic-bezier(.4,0,.2,1)}
 .fill.warm{background:linear-gradient(90deg,#4a2010,var(--or))}.fill.hot{background:linear-gradient(90deg,#6a0000,var(--red))}
 .cmb-foot{display:flex;justify-content:space-between;align-items:center}
+.anomaly-row{margin-top:10px;padding-top:10px;border-top:1px solid var(--bd);font-family:'Share Tech Mono',monospace;font-size:11px;display:none}
+.anomaly-row.show{display:block}
+.anomaly-row .lbl{color:var(--mut2)}
+.anomaly-row .val{font-weight:700}
+.anomaly-row .val.norm{color:var(--cy)}.anomaly-row .val.warn{color:var(--or)}.anomaly-row .val.hot{color:var(--red)}
 .cmb-boxes{font-size:15px;font-weight:600}
 .cmb-boxes b{font-family:'Share Tech Mono',monospace;color:var(--cy);font-size:17px}
 .cmb-exp{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--mut2)}
@@ -799,6 +1022,18 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 .hstat-v{font-family:'Share Tech Mono',monospace;font-size:16px;color:var(--cy)}
 .hstat-l{font-size:9px;color:var(--mut2);text-transform:uppercase;margin-top:2px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.an-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+.an-card{background:var(--bg2);border:1px solid var(--bd);border-radius:6px;padding:10px;text-align:center}
+.an-v{font-family:'Share Tech Mono',monospace;font-size:18px;color:var(--cy);font-weight:700}
+.an-v.good{color:var(--grn)}.an-v.warn{color:var(--or)}.an-v.bad{color:var(--red)}
+.an-l{font-size:9px;color:var(--mut2);text-transform:uppercase;letter-spacing:.5px;margin-top:3px}
+.an-sub{font-size:10px;color:var(--mut2);font-family:'Share Tech Mono',monospace;margin-top:3px}
+.an-item{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:var(--bg2);border:1px solid var(--bd);border-radius:5px;margin-bottom:5px;font-size:12px}
+.an-item-n{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
+.an-item-v{font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--mut2)}
+.an-item-v b{color:var(--tx)}
+.an-intervals{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--mut2);padding:8px 10px;background:var(--bg2);border:1px solid var(--bd);border-radius:5px;margin-top:6px;line-height:1.6}
+.an-note{font-size:10px;color:var(--mut2);font-style:italic;margin-top:6px;line-height:1.4}
 .chip{font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 9px;border:1px solid var(--bd);border-radius:4px;display:flex;align-items:center;gap:5px;background:var(--bg2)}
 .tl-toggle{width:100%;padding:11px;border-radius:6px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;text-transform:uppercase;border:1px solid var(--bd);background:var(--bg2);color:var(--cy);transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
 .tl-toggle:active{background:var(--bg3)}
@@ -848,6 +1083,7 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
   <div class="cmb-top"><span class="cmb-lbl">Sequía global · cualquier raro</span><span class="cmb-big" id="cPct">—</span></div>
   <div class="track"><div class="fill" id="cFill" style="width:0%"></div></div>
   <div class="cmb-foot"><span class="cmb-boxes"><b id="cBoxes">—</b> cajas sin caer ningún raro</span><span class="cmb-exp" id="cExp"></span></div>
+  <div class="anomaly-row" id="anomalyRow"></div>
 </div>
 
 <div class="kpis kpis-1">
@@ -861,6 +1097,17 @@ h1{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cy);letter
 
 <div class="sec">Presión individual por item</div>
 <div id="items"></div>
+
+<div class="sec">Análisis · observado vs declarado</div>
+<div id="analysisWrap">
+  <div class="an-cards">
+    <div class="an-card"><div class="an-v" id="anHonesty">—</div><div class="an-l">Índice honestidad</div><div class="an-sub" id="anHonestySub"></div></div>
+    <div class="an-card"><div class="an-v" id="anObs">—</div><div class="an-l">Raros observados</div><div class="an-sub" id="anObsSub"></div></div>
+    <div class="an-card"><div class="an-v" id="anConf">—</div><div class="an-l">Fiabilidad</div><div class="an-sub" id="anConfSub"></div></div>
+  </div>
+  <div id="anItems"></div>
+  <div id="anIntervals" class="an-intervals"></div>
+</div>
 
 <div class="sec">Evolución de la presión combinada · 14 días</div>
 <div class="chart-wrap"><canvas id="chart"></canvas><div class="chart-legend"><span id="chartFrom">—</span><span>presión combinada %</span><span id="chartTo">ahora</span></div></div>
@@ -931,6 +1178,63 @@ function renderHome(payload){
   });
 }
 
+function renderAnalysis(a){
+  const wrap=document.getElementById('analysisWrap');
+  if(!a||a.boxes_observed==null||a.boxes_observed<1){
+    wrap.style.opacity='0.5';
+    document.getElementById('anHonesty').textContent='—';
+    document.getElementById('anHonestySub').textContent='sin datos aún';
+    document.getElementById('anObs').textContent='0';
+    document.getElementById('anObsSub').textContent='';
+    document.getElementById('anConf').textContent='—';
+    document.getElementById('anConfSub').textContent='';
+    document.getElementById('anItems').innerHTML='';
+    document.getElementById('anIntervals').innerHTML='<span style="font-style:italic">El análisis se construye observando drops en vivo. Necesita tiempo para ser fiable.</span>';
+    return;
+  }
+  wrap.style.opacity='1';
+  // Índice de honestidad — solo se interpreta con confianza suficiente
+  const h=a.honesty_ratio;
+  const hEl=document.getElementById('anHonesty');
+  if(h!=null){
+    hEl.textContent=h.toFixed(2)+'×';
+    if(a.confidence==='baja'){
+      // datos insuficientes: mostrar el número pero en gris, sin veredicto
+      hEl.className='an-v';
+      document.getElementById('anHonestySub').textContent='datos insuficientes aún';
+    }else{
+      const cls=h>=0.85?'good':h>=0.6?'warn':'bad';
+      hEl.className='an-v '+cls;
+      document.getElementById('anHonestySub').textContent=a.verdict||'';
+    }
+  }else{hEl.textContent='—';document.getElementById('anHonestySub').textContent='';}
+  // Observados
+  document.getElementById('anObs').textContent=a.total_observed;
+  document.getElementById('anObsSub').textContent='esperados: '+a.expected_drops;
+  // Fiabilidad
+  const conf=a.confidence||'baja';
+  const cEl=document.getElementById('anConf');
+  cEl.textContent=conf;
+  cEl.className='an-v '+(conf==='alta'?'good':conf==='media'?'warn':'bad');
+  document.getElementById('anConfSub').textContent=nf(a.boxes_observed)+' cajas obs.';
+  // Por item
+  document.getElementById('anItems').innerHTML=(a.per_item||[]).map(it=>{
+    const obsP=it.observed_prob!=null?it.observed_prob+'%':'—';
+    return `<div class="an-item"><span class="an-item-n"><span class="dot ${RAR[it.key]||'milspec'}"></span>${it.short}</span>`+
+      `<span class="an-item-v">obs <b>${it.observed}</b> / esp <b>${it.expected}</b> · real <b>${obsP}</b> vs <b>${it.declared_prob}%</b></span></div>`;
+  }).join('');
+  // Intervalos
+  const iv=a.intervals;
+  if(iv){
+    document.getElementById('anIntervals').innerHTML=
+      `Intervalos entre raros (cajas): media observada <b style="color:var(--tx)">${nf(iv.mean)}</b> · mediana ${nf(iv.median)} · `+
+      `min ${nf(iv.min)} / max ${nf(iv.max)} · declarada ${nf(iv.declared_mean)}`+
+      `<div class="an-note">Si la caja es justa, la media observada debería acercarse a la declarada a medida que se acumulan datos.</div>`;
+  }else{
+    document.getElementById('anIntervals').innerHTML='<span style="font-style:italic">Aún no hay intervalos entre drops registrados.</span>';
+  }
+}
+
 function drawChart(series){
   const cv=document.getElementById('chart');const dpr=window.devicePixelRatio||1;
   const w=cv.clientWidth,h=140;cv.width=w*dpr;cv.height=h*dpr;
@@ -977,6 +1281,15 @@ async function load(){
     document.getElementById('cBoxes').textContent=nf(d.boxes_since_any);
     document.getElementById('cExp').textContent='media: 1 raro cada '+nf(d.expected_every)+' cajas';
     document.getElementById('cExp').title='Sale de sumar las probabilidades de todos los raros ('+(d.kpis&&d.kpis.total_prob_pct||'')+'%) e invertir. Es fijo salvo que la caja cambie.';
+    // Factor de anomalía (racha)
+    const aRow=document.getElementById('anomalyRow');
+    const an=d.analysis&&d.analysis.anomaly;
+    if(an!=null){
+      aRow.classList.add('show');
+      const c=an>=3?'hot':an>=2?'warn':'norm';
+      const txt=an>=3?'racha muy anómala':an>=2?'más seca de lo normal':'dentro de lo esperado';
+      aRow.innerHTML=`<span class="lbl">Racha actual: </span><span class="val ${c}">${an.toFixed(1)}× lo esperado</span> <span class="lbl">· ${txt}</span>`;
+    }else{aRow.classList.remove('show');}
     // KPIs
     const k=d.kpis||{};
     const hsk=d.history_stats||{};
@@ -1004,6 +1317,8 @@ async function load(){
         </div>
       </div>`;
     }).join('');
+    // ── Análisis observado vs declarado ──
+    renderAnalysis(d.analysis||{});
     // chart
     drawChart(d.pressure_series||[]);
     const ps=d.pressure_series||[];
@@ -1051,61 +1366,115 @@ window.addEventListener('resize',()=>{if(currentView==='detail')load();});
 """
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
     def log_message(self, *a): pass
-    def _json(self, obj, code=200):
-        body = json.dumps(obj).encode()
-        self.send_response(code); self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length', str(len(body))); self.end_headers()
-        self.wfile.write(body)
-    def do_POST(self):
-        # /action/check/<case_id>  o  /action/check (todas)
-        if self.path.startswith('/action/check'):
-            parts = self.path.split('/')
-            cid = parts[3] if len(parts) > 3 and parts[3] else None
-            if cid and get_monitor(cid):
-                get_monitor(cid).control['force_check'] = True
-            else:
-                for m in MONITORS.values():
-                    m.control['force_check'] = True
-            self._json({'ok': True})
-        else:
-            self._json({'ok': False}, 404)
-    def do_GET(self):
-        if self.path == '/data' or self.path.startswith('/data?'):
-            # Payload con todas las cajas
-            self._json({'cases': [m.dashboard for m in MONITORS.values()]})
-        else:
-            body = DASHBOARD_HTML.encode()
-            self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body))); self.end_headers()
+
+    def _safe_write(self, body):
+        # Escribir ignorando desconexiones del cliente (polling, recargas, móvil)
+        try:
             self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:
+            log.error(f"web write error: {e}")
+
+    def _json(self, obj, code=200):
+        try:
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        except Exception as e:
+            log.error(f"web header error: {e}")
+            return
+        self._safe_write(body)
+
+    def do_POST(self):
+        try:
+            if self.path.startswith('/action/check'):
+                parts = self.path.split('/')
+                cid = parts[3] if len(parts) > 3 and parts[3] else None
+                if cid and get_monitor(cid):
+                    get_monitor(cid).control['force_check'] = True
+                else:
+                    for m in MONITORS.values():
+                        m.control['force_check'] = True
+                self._json({'ok': True})
+            else:
+                self._json({'ok': False}, 404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def do_GET(self):
+        try:
+            if self.path == '/data' or self.path.startswith('/data?'):
+                self._json({'cases': [m.dashboard for m in MONITORS.values()]})
+            elif self.path == '/health':
+                cases_health = [m.health() for m in MONITORS.values()]
+                all_ok = all(c['healthy'] for c in cases_health) if cases_health else False
+                self._json({'ok': all_ok, 'cases': cases_health,
+                            'ts': datetime.utcnow().isoformat() + 'Z'},
+                           200 if all_ok else 503)
+            else:
+                body = DASHBOARD_HTML.encode()
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
+                self._safe_write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+from socketserver import ThreadingMixIn
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    # Evita que un error en un hilo de petición tumbe el servidor
+    def handle_error(self, request, client_address):
+        pass
 
 def start_web():
-    HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 # ── LOOP PRINCIPAL ────────────────────────────────────────────────────────────
 def case_loop(m):
-    """Hilo por caja: chequea cada CHECK_INTERVAL, respeta force_check."""
+    """Hilo por caja: chequea cada CHECK_INTERVAL, respeta force_check y rate-limit."""
     last_check = 0
     fails = 0
     while True:
-        now = time.time()
-        due = (now - last_check) >= CHECK_INTERVAL
-        forced = m.control['force_check']
-        if due or forced:
-            if forced:
-                m.control['force_check'] = False
-                log.info(f"[{m.case_id}] check forzado")
-            ok = m.do_check()
-            last_check = time.time()
-            if ok:
-                fails = 0
-            else:
-                fails += 1
-                m.dashboard['status'] = 'sin datos'
-                if fails == 3:
-                    send_telegram(f"⚠️ <b>{m.name}:</b> 3 fallos seguidos leyendo la API.")
-        time.sleep(1)
+        try:
+            now = time.time()
+            # Respetar rate-limit: si la API nos limitó, esperar
+            if m.is_rate_limited():
+                time.sleep(2)
+                continue
+            due = (now - last_check) >= CHECK_INTERVAL
+            forced = m.control['force_check']
+            if due or forced:
+                if forced:
+                    m.control['force_check'] = False
+                    log.info(f"[{m.case_id}] check forzado")
+                ok = m.do_check()
+                last_check = time.time()
+                if ok:
+                    if fails >= 3:
+                        send_telegram(f"✅ <b>{m.name}:</b> conexión restablecida con la API.")
+                    fails = 0
+                else:
+                    fails += 1
+                    m.dashboard['status'] = 'sin datos'
+                    if fails == 3:
+                        send_telegram(f"⚠️ <b>{m.name}:</b> 3 fallos seguidos leyendo la API.")
+            time.sleep(1)
+        except Exception as e:
+            # Una excepción inesperada NO debe matar el hilo de la caja
+            log.error(f"[{m.case_id}] error en case_loop: {e}")
+            time.sleep(5)
 
 def main():
     log.info(f"CS2 Multi-Monitor arrancando con {len(CASES)} cajas...")
@@ -1129,13 +1498,67 @@ def main():
     else:
         send_telegram(f"⏳ <b>CS2 Multi-Monitor desplegado</b> — {len(CASES)} cajas, conectando...")
 
-    # Un hilo por caja
+    # Un hilo por caja, con supervisión
+    threads = {}
     for m in MONITORS.values():
-        threading.Thread(target=case_loop, args=(m,), daemon=True).start()
+        t = threading.Thread(target=case_loop, args=(m,), daemon=True)
+        t.start()
+        threads[m.case_id] = t
 
-    # Mantener vivo el proceso principal
+    # Watchdog: si un hilo de caja muere, lo reinicia y avisa
     while True:
-        time.sleep(3600)
+        time.sleep(30)
+        for cid, m in MONITORS.items():
+            t = threads.get(cid)
+            if t is None or not t.is_alive():
+                log.error(f"[{cid}] hilo caído — reiniciando")
+                send_telegram(f"🔄 <b>{m.name}:</b> el hilo se detuvo, reiniciándolo automáticamente.")
+                nt = threading.Thread(target=case_loop, args=(m,), daemon=True)
+                nt.start()
+                threads[cid] = nt
+
+def self_test():
+    """Valida la lógica clave sin red. Útil antes de desplegar: python3 monitor.py --test"""
+    ok = True
+    def check(name, cond):
+        nonlocal ok
+        print(("  ✓ " if cond else "  ✗ ") + name)
+        if not cond: ok = False
+
+    print("── SELF-TEST ──")
+    # Math
+    check("prob_acum(0.0001, 10000) ≈ 63.2%", abs(prob_acum(0.0001, 10000) - 63.21) < 1)
+    check("combined_prob(0, n) = 0", combined_prob(0, 100) == 0)
+    check("prob_acum con n=0 es 0", prob_acum(0.01, 0) == 0)
+    # Nombre base
+    m = CaseMonitor('cc-test', 'Test', '/tmp/_selftest.json')
+    check("_base_name quita desgaste", m._base_name("AK-47 | Vulcan (Field-Tested)") == "AK-47 | Vulcan")
+    check("_base_name quita StatTrak", m._base_name("StatTrak™ AK-47 | Vulcan (FT)") == "AK-47 | Vulcan")
+    check("_base_name quita estrella", m._base_name("★ Butterfly Knife | Fade (FN)") == "Butterfly Knife | Fade")
+    # Estado sano
+    check("_sane rechaza no-dict", not m._sane("x"))
+    check("_sane acepta dict válido", m._sane({'base_counter': 100}))
+    check("_sane rechaza base negativo", not m._sane({'base_counter': -5}))
+    # Migración de claves viejas
+    m.state['group_last_seen'] = {'ak47': 500, 'awp': 600}
+    m.state['group_probs'] = {'ak47': 0.0001, 'awp': 0.00002}
+    m._migrate_legacy_keys()
+    check("migración traduce ak47", 'AK-47 | Vulcan' in m.state['group_last_seen'])
+    check("migración elimina clave vieja", 'ak47' not in m.state['group_last_seen'])
+    # only_items
+    m2 = CaseMonitor('cc-test2', 'Test2', '/tmp/_selftest2.json', only_items=['m4a4 | hellfire'])
+    check("only_items en minúsculas", m2.only_items == ['m4a4 | hellfire'])
+
+    # limpiar
+    for f in ('/tmp/_selftest.json', '/tmp/_selftest2.json'):
+        try: os.remove(f)
+        except Exception: pass
+
+    print("── RESULTADO:", "TODO OK ✅" if ok else "HAY FALLOS ❌", "──")
+    return ok
 
 if __name__ == '__main__':
+    import sys
+    if '--test' in sys.argv:
+        sys.exit(0 if self_test() else 1)
     main()

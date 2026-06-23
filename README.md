@@ -1,43 +1,40 @@
-# CS2 Multi-Case Monitor
+# CS2 Multi-Case Monitor — edición robusta
 
-Monitor autónomo para varias cajas de skin.club vía API pública. Alertas Telegram
-+ panel web con Home de selección + gráfica 14 días + estado persistente por caja.
+Monitor autónomo multi-caja para skin.club. Alertas Telegram + panel web con
+análisis estadístico + health check + estado persistente con backup.
 
-## Cajas monitorizadas (por defecto)
-- DONT TRUST (cc-bf4940a7e)
-- 1º NO PAIN 85% (cc-08e7b18f7)
-- NO PAIN 84% PROFIT (cc-c81e43fb8)
+## Funciones principales
+- Multi-caja en paralelo (hilo + estado independiente por caja)
+- Detección automática de raros por probabilidad (<= RARE_MAX_CHANCE)
+- Filtro only_items por caja (seguir solo items concretos)
+- Presión acumulada individual y combinada, alertas por niveles (90/95%)
+- Análisis tasa observada vs declarada (honestidad de la caja) con confianza
+- Factor de anomalía: avisa si una caja lleva N× lo esperado sin pagar
+- Histórico de drops con presión al caer, gráfica de 14 días
+- Caja muerta, racha anómala, cambios de API, rate-limit: todo con avisos
+- Persistencia con backup rotativo + recuperación ante corrupción
+- Watchdog que reinicia hilos caídos · health endpoint /health
+- Logging rotativo a /data/monitor.log
+- Horarios en hora de España peninsular
 
-## Cómo funciona
-Cada caja se monitoriza en su propio hilo, con estado independiente en
-/data/state_<id>.json (la caja original usa /data/state.json por compatibilidad).
-Los items raros se detectan AUTOMÁTICAMENTE: cualquier item con probabilidad
-<= RARE_MAX_CHANCE (0.01% por defecto) se sigue como raro y se agrupa por nombre.
+## Endpoints
+- /        panel web
+- /data    JSON de todas las cajas
+- /health  estado de salud (200 si OK, 503 si alguna caja no responde)
+
+## Validar antes de desplegar
+    python3 monitor.py --test
 
 ## Variables de entorno
+TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (obligatorias). Opcionales: CHECK_INTERVAL (60),
+ALERT_LEVELS (90,95), DEAD_AFTER_MIN (60), RARE_MAX_CHANCE (0.01),
+ANOMALY_FACTOR (3), DATA_DIR (/data), CASES_JSON (override de cajas).
 
-| Variable | Defecto | Descripción |
-|----------|---------|-------------|
-| TELEGRAM_TOKEN | (obligatoria) | token del bot |
-| TELEGRAM_CHAT_ID | (obligatoria) | tu chat ID |
-| CHECK_INTERVAL | 60 | segundos entre checks |
-| ALERT_LEVELS | 90,95 | niveles % de alerta |
-| DEAD_AFTER_MIN | 60 | min sin subir = caja muerta |
-| RARE_MAX_CHANCE | 0.01 | % máximo para considerar un item "raro" |
-| DATA_DIR | /data | carpeta de estados (Volume) |
-| CASES_JSON | (opcional) | lista de cajas en JSON para override |
+## Monitorización externa recomendada
+Apunta UptimeRobot (gratis) a https://<tu-dominio>/health cada 5 min para que te
+avise por email/push si el sistema entero cae (cuando Telegram tampoco respondería).
 
-## Añadir/quitar cajas
-Edita la lista CASES en el código, o usa la variable CASES_JSON, ej:
-[{"id":"cc-xxx","name":"Mi Caja"}]
-
-## Panel web
-Home con las cajas (cada una muestra su % de sequía y datos). Pulsa una para
-ver su monitor completo. "◄ Volver" regresa a la lista.
-
-## Comandos de Telegram
-/menu (botones por caja) · /estado · /historico · /check (todas)
-
-## Migración automática
-Al actualizar desde la versión mono-caja, el estado existente (claves ak47,
-butterfly...) se traduce automáticamente a los nombres nuevos sin perder el conteo.
+## Cajas por defecto
+- DONT TRUST (cc-bf4940a7e)
+- 1º NO PAIN 85% (cc-08e7b18f7)
+- NO PAIN 84% PROFIT (cc-c81e43fb8) — solo M4A4 Hellfire
